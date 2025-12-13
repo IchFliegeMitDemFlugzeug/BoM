@@ -1,0 +1,5 @@
+Project_code = 'СГТЕ' or 'SGTE'
+Repeating_subassemblies_in_tree = true
+Non-drawing_parts_as_materials = true
+Mass_of_standard_parts = false
+Mass_of_pki = false
