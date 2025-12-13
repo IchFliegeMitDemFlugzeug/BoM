@@ -3,6 +3,16 @@ Option Explicit                                                                 
 ' -----------------------------                                                    ' Раздел комментария
 ' Точка входа макроса CATIA                                                        ' Описание
 ' -----------------------------                                                    ' Раздел комментария
+Dim gProjectCodes                                                                 ' Глобальный список допустимых префиксов проекта
+Dim gRepeatingSubassemblies                                                       ' Глобальный флаг разворачивать повторяющиеся подсборки
+Dim gNonDrawingPartsAsMaterials                                                   ' Флаг “бесчертежные ткани -> материалы”
+Dim gMassOfStandardParts                                                          ' Флаг “показывать массу стандартных изделий”
+Dim gMassOfPKI                                                                    ' Флаг “показывать массу ПКИ”
+Dim gCodeRules                                                                    ' Правила заполнения столбца "код" из Code.tsv
+Dim gMetalMarks                                                                   ' Список марок металлов из metals_ru_library.tsv
+Dim gCompositeKeywords                                                            ' Список ключевых слов для композитов из composites_detect_keywords.tsv
+Dim gFabricKeywords                                                               ' Подмножество ключевых слов армирования (признак тканей)
+
 Sub CATMain()                                                                     ' Главная процедура, которую вызывает CATIA
 
     Dim asmDoc                                                                    ' Переменная для активного документа
@@ -39,6 +49,17 @@ Sub CATMain()                                                                   
 
     Dim workFolder                                                                ' Папка, где лежат файлы
     workFolder = GetFolderFromFullPath(outXlsx)                                   ' Папка = папка выбранного Excel
+
+    gProjectCodes = DefaultProjectCodes()                                         ' Заполняем список кодов проекта значениями по умолчанию
+    gRepeatingSubassemblies = False                                               ' Ставим дефолт для флага раскрутки подсборок
+
+    gNonDrawingPartsAsMaterials = False                                           ' По умолчанию БЧ-детали не переводим в материалы
+    gMassOfStandardParts = False                                                  ' По умолчанию не выводим массы стандартных изделий
+    gMassOfPKI = False                                                            ' По умолчанию не выводим массы ПКИ
+
+    Call LoadSettings(workFolder & "\Settings.txt", gProjectCodes, gRepeatingSubassemblies, gNonDrawingPartsAsMaterials, gMassOfStandardParts, gMassOfPKI) ' Пытаемся прочитать настройки пользователя
+    gCodeRules = LoadCodeRules(workFolder & "\Code.tsv")                        ' Загружаем правила для столбца "код"
+    Call LoadMaterialLibraries(workFolder)                                        ' Готовим списки металлов/композитов
 
     Dim builderPath                                                               ' Путь к ExcelBuilder
     builderPath = workFolder & "\ExcelBuilder.vbs"                                ' ExcelBuilder должен лежать рядом
@@ -139,6 +160,9 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
 
         Dim key                                                                   ' Ключ агрегирования
         key = childPN & "|" & docType                                             ' PartNumber + тип документа
+        If docType = "ProductDocument" And gRepeatingSubassemblies = True Then    ' Если это подсборка и нужно разворачивать повторы
+            key = key & "|" & CStr(i)                                            ' Делаем ключ уникальным для каждого вхождения
+        End If                                                                     ' Конец проверки раскрутки подсборок
 
         If dictQty.Exists(key) Then                                               ' Если позиция уже встречалась
             dictQty(key) = CLng(dictQty(key)) + 1                                 ' Увеличиваем количество
@@ -220,11 +244,13 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
         Dim thisDef                                                                ' Definition позиции
         thisDef = SafeGetDefinition(childObj)                                      ' Берём Definition
+        Dim thisDesc                                                               ' Description позиции (для кода/БЧ)
+        thisDesc = SafeGetDescription(childObj)                                    ' Берём Description отдельно от Definition
 
         If docType = "ProductDocument" Then                                        ' Если подсборка
 
             Dim asmLineIndex                                                       ' Индекс строки подсборки в payload
-            asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, "сб", "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
+            asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, DetectCode("ASM", thisDesc), "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
 
             Dim asmMassEach                                                        ' Масса 1 шт подсборки
             asmMassEach = ProcessNodeCollect(childObj, thisPN, depth + 1, lines)   ' Рекурсивно обрабатываем подсборку
@@ -239,7 +265,26 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 ' ВАЖНО: для крепежа НЕ заполняем N, O, P, Q в Excel.               ' Пояснение
                 ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "крепеж". ' Пояснение
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, "крепеж", "", "", Empty, Empty)
+                Dim fastMassEach
+                Dim fastMassTotal
+                fastMassEach = Empty
+                fastMassTotal = Empty
+                If gMassOfStandardParts = True Then
+                    Dim fastPartDoc
+                    On Error Resume Next
+                    Set fastPartDoc = childObj.ReferenceProduct.Parent
+                    If Err.Number = 0 Then
+                        Dim tmpMat
+                        Call MeasurePartMaterialAndMass(fastPartDoc, tmpMat, fastMassEach)
+                        fastMassTotal = CDbl(fastMassEach) * qty
+                    End If
+                    On Error GoTo 0
+                End If
+
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, DetectCode("FAST", thisDesc), "", "", fastMassEach, fastMassTotal)
+                If Not IsEmpty(fastMassTotal) Then
+                    addMass = addMass + CDbl(fastMassTotal)
+                End If
 
 
                 ' Массу крепежа не считаем                                          ' Пояснение
@@ -248,7 +293,26 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 ' ВАЖНО: для ПКИ НЕ заполняем N, O, P, Q в Excel.                   ' Пояснение
                 ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "ПКИ". ' Пояснение
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, "ПКИ", "", "", Empty, Empty)
+                Dim pkiMassEach
+                Dim pkiMassTotal
+                pkiMassEach = Empty
+                pkiMassTotal = Empty
+                If gMassOfPKI = True Then
+                    Dim pkiPartDoc
+                    On Error Resume Next
+                    Set pkiPartDoc = childObj.ReferenceProduct.Parent
+                    If Err.Number = 0 Then
+                        Dim tmpMatPki
+                        Call MeasurePartMaterialAndMass(pkiPartDoc, tmpMatPki, pkiMassEach)
+                        pkiMassTotal = CDbl(pkiMassEach) * qty
+                    End If
+                    On Error GoTo 0
+                End If
+
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, DetectCode("PKI", thisDesc), "", "", pkiMassEach, pkiMassTotal)
+                If Not IsEmpty(pkiMassTotal) Then
+                    addMass = addMass + CDbl(pkiMassTotal)
+                End If
 
 
                 ' Массу ПКИ не считаем                                              ' Пояснение
@@ -263,9 +327,23 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
                 Call MeasurePartMaterialAndMass(partDoc, partMat, partMassEach)    ' Измеряем материал и массу
 
                 Dim typeN                                                          ' Класс материала для столбца N (Металл/Композит/Неметалл)
-                typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по ключевым словам (см. функцию ниже)
+                typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по библиотекам
 
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,"дет",typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
+                Dim codeValue                                                      ' Код для столбца M
+                codeValue = DetectCode("PART", thisDesc)
+
+                Dim hidePartAsMaterial                                             ' Флаг: скрыть деталь и заменить материалом
+                hidePartAsMaterial = ShouldHideNonDrawingPart(thisDesc, partMat)
+
+                If hidePartAsMaterial = True Then                                  ' Если БЧ-ткань и включена настройка
+
+                    AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "MAT", "материал", partMat, partMat, parentPN, partMassEach * qty, DetectCode("MAT", ""), "", partMat, partMassEach, partMassEach * qty) ' Строка материала вместо детали
+
+                Else
+
+                    AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,codeValue,typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
+
+                End If
 
                 addMass = addMass + (partMassEach * qty)                           ' Добавляем вклад в массу родителя
 
@@ -534,6 +612,56 @@ Function SafeGetDefinition(prodObj)
 End Function                                                                        ' Конец SafeGetDefinition
 
 
+Function SafeGetDescription(prodObj)
+
+    Dim s                                                                           ' Строка результата
+    s = ""                                                                         ' Инициализация
+
+    On Error Resume Next                                                           ' Перехватываем ошибки доступа к свойствам
+    s = prodObj.ReferenceProduct.Description                                       ' Прямое свойство Description
+    If Err.Number <> 0 Then
+        Err.Clear
+        s = ""
+    End If
+
+    If Trim(s) = "" Then
+        s = SafeReadUserProperty(prodObj.ReferenceProduct, "Description")          ' Пробуем пользовательское свойство
+    End If
+    If Trim(s) = "" Then
+        s = SafeReadUserProperty(prodObj, "Description")                          ' Фолбэк на экземпляр
+    End If
+    If Trim(s) = "" Then
+        s = SafeReadUserProperty(prodObj, "DESCRIPTION")                          ' Пробуем верхний регистр
+    End If
+
+    On Error GoTo 0                                                                 ' Возвращаем обычный режим
+    SafeGetDescription = CStr(s)                                                    ' Возвращаем строку
+
+End Function                                                                        ' Конец SafeGetDescription
+
+
+Function SafeReadUserProperty(obj, propName)
+
+    Dim val                                                                        ' Результат
+    val = ""
+
+    On Error Resume Next
+    Dim props
+    Set props = obj.UserRefProperties
+    If Err.Number = 0 Then
+        Dim item
+        Set item = props.Item(propName)
+        If Err.Number = 0 Then
+            val = item.Value
+        End If
+    End If
+    On Error GoTo 0
+
+    SafeReadUserProperty = CStr(val)
+
+End Function                                                                        ' Конец SafeReadUserProperty
+
+
 Function SafeGetPartNumber(prodObj)
 
     Dim s                                                                           ' Строка результата
@@ -578,13 +706,15 @@ Function IsSGTE(partNumber)
     Dim s                                                                           ' Нормализованная строка
     s = UCase(Trim(CStr(partNumber)))                                              ' Приводим к верхнему регистру и обрезаем
 
-    If Left(s, 4) = "SGTE" Then                                                    ' Латинский префикс
-        IsSGTE = True                                                              ' Да
-    ElseIf Left(s, 4) = "СГТЕ" Then                                                ' Кириллический префикс
-        IsSGTE = True                                                              ' Да
-    Else                                                                           ' Иначе
-        IsSGTE = False                                                             ' Нет
-    End If                                                                         ' Конец ветвления
+    Dim idx                                                                         ' Индекс по массиву кодов
+    For idx = LBound(gProjectCodes) To UBound(gProjectCodes)                       ' Перебираем все коды проекта
+        If Left(s, Len(CStr(gProjectCodes(idx)))) = UCase(CStr(gProjectCodes(idx))) Then ' Сравниваем префикс с кодом
+            IsSGTE = True                                                          ' Нашли совпадение
+            Exit Function                                                          ' Выходим сразу
+        End If                                                                     ' Конец проверки префикса
+    Next                                                                           ' Следующий код проекта
+
+    IsSGTE = False                                                                 ' Если не нашли ни одного совпадения — False
 
 End Function                                                                        ' Конец IsSGTE
 
@@ -644,72 +774,203 @@ Function GuessCompMetalPlusFoam(materialName)
         Exit Function                                                              ' Выходим
     End If                                                                         ' Конец проверки пустого материала
 
-    ' --------------------                                                          ' Блок 1: Композиты (включая пенопласт)
-    If InStr(s, "пенопласт") > 0 Then                                              ' Явный пенопласт
-        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом (как ты просил)
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки пенопласта
+    If IsCompositeByKeywords(s) Then                                               ' Проверяем словарь композитов
+        GuessCompMetalPlusFoam = "Композит"                                        ' Возвращаем "Композит"
+        Exit Function
+    End If
 
-    If InStr(s, "foam") > 0 Or InStr(s, "airex") > 0 Or InStr(s, "roha") > 0 Or InStr(s, "diviny") > 0 Then ' Пены/заполнители в латинице
-        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки пенных заполнителей
+    If IsMetalByKeywords(s) Then                                                   ' Проверяем словарь металлов
+        GuessCompMetalPlusFoam = "Металл"                                          ' Возвращаем "Металл"
+        Exit Function
+    End If
 
-    If InStr(s, "угл") > 0 Or InStr(s, "угле") > 0 Then                            ' Углеродные материалы (угл/угле)
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки углерода
-
-    If InStr(s, "carbon") > 0 Or InStr(s, "cfrp") > 0 Then                          ' Carbon/CFRP
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки carbon/cfrp
-
-    If InStr(s, "ткан") > 0 Then                                                   ' Любая "ткань" (стекло/уголь/арамид и т.п.)
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки тканевых материалов
-
-    If InStr(s, "стеклопласт") > 0 Or InStr(s, "gfrp") > 0 Then                    ' Стеклопласт/ GFRP
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки стеклопластика
-
-    If InStr(s, "aramid") > 0 Or InStr(s, "кевл") > 0 Or InStr(s, "kevlar") > 0 Then ' Арамид/кевлар
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки арамидов
-
-    If InStr(s, "эпокс") > 0 Or InStr(s, "epoxy") > 0 Or InStr(s, "смол") > 0 Or InStr(s, "resin") > 0 Then ' Связующие
-        GuessCompMetalPlusFoam = "Композит"                                        ' В контексте КД это обычно композитная часть
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки связующих
-
-    ' --------------------                                                          ' Блок 2: Металлы
-    If InStr(s, "алю") > 0 Or InStr(s, "д16") > 0 Or InStr(s, "амг") > 0 Or InStr(s, "al ") > 0 Or InStr(s, "al-") > 0 Then ' Алюминиевые сплавы/AL
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки алюминия
-
-    If InStr(s, "сталь") > 0 Or InStr(s, "steel") > 0 Or InStr(s, "12х18") > 0 Or InStr(s, "40х") > 0 Or InStr(s, "aisi") > 0 Then ' Стали/марки
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки стали
-
-    If InStr(s, "титан") > 0 Or InStr(s, "titan") > 0 Or InStr(s, "ti") > 0 Or InStr(s, "вт") > 0 Then ' Титан/ВТ/ Ti
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки титана
-
-    If InStr(s, "магн") > 0 Or InStr(s, "mg") > 0 Then                             ' Магниевые сплавы (очень грубо)
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки магния
-
-    ' --------------------                                                          ' Блок 3: Всё остальное (пластики, резины, керамика и т.п.)
-    GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не металл и не композит — считаем неметаллом
+    GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не попали в словари — считаем неметаллом
 
 End Function                                                                        ' Конец GuessCompMetalPlusFoam
+
+
+Function IsMetalByKeywords(materialLower)
+
+    On Error Resume Next
+    Dim lb, ub
+    lb = LBound(gMetalMarks)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        IsMetalByKeywords = False
+        Exit Function
+    End If
+    ub = UBound(gMetalMarks)
+    On Error GoTo 0
+
+    Dim i
+    For i = lb To ub
+        If Trim(CStr(gMetalMarks(i))) <> "" Then
+            If InStr(materialLower, LCase(CStr(gMetalMarks(i)))) > 0 Then
+                IsMetalByKeywords = True
+                Exit Function
+            End If
+        End If
+    Next
+
+    IsMetalByKeywords = False
+
+End Function                                                                        ' Конец IsMetalByKeywords
+
+
+Function IsCompositeByKeywords(materialLower)
+
+    On Error Resume Next
+    Dim lb, ub
+    lb = LBound(gCompositeKeywords)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        IsCompositeByKeywords = False
+        Exit Function
+    End If
+    ub = UBound(gCompositeKeywords)
+    On Error GoTo 0
+
+    Dim i
+    For i = lb To ub
+        Dim item
+        item = gCompositeKeywords(i)
+        Dim kw
+        kw = CStr(item(1))
+        Dim mode
+        mode = LCase(CStr(item(2)))
+        If mode = "regex" Then
+            Dim re
+            Set re = CreateObject("VBScript.RegExp")
+            re.IgnoreCase = True
+            re.Global = False
+            re.Pattern = kw
+            If re.Test(materialLower) Then
+                IsCompositeByKeywords = True
+                Exit Function
+            End If
+        Else
+            If InStr(materialLower, kw) > 0 Then
+                IsCompositeByKeywords = True
+                Exit Function
+            End If
+        End If
+    Next
+
+    IsCompositeByKeywords = False
+
+End Function                                                                        ' Конец IsCompositeByKeywords
+
+
+Function IsFabricMaterial(materialLower)
+
+    On Error Resume Next
+    Dim lb, ub
+    lb = LBound(gFabricKeywords)
+    If Err.Number <> 0 Then
+        Err.Clear
+        On Error GoTo 0
+        IsFabricMaterial = False
+        Exit Function
+    End If
+    ub = UBound(gFabricKeywords)
+    On Error GoTo 0
+
+    Dim i
+    For i = lb To ub
+        Dim item
+        item = gFabricKeywords(i)
+        Dim kw
+        kw = CStr(item(1))
+        Dim mode
+        mode = LCase(CStr(item(2)))
+        If mode = "regex" Then
+            Dim re
+            Set re = CreateObject("VBScript.RegExp")
+            re.IgnoreCase = True
+            re.Global = False
+            re.Pattern = kw
+            If re.Test(materialLower) Then
+                IsFabricMaterial = True
+                Exit Function
+            End If
+        Else
+            If InStr(materialLower, kw) > 0 Then
+                IsFabricMaterial = True
+                Exit Function
+            End If
+        End If
+    Next
+
+    IsFabricMaterial = False
+
+End Function                                                                        ' Конец IsFabricMaterial
+
+
+Function DetectCode(kindValue, descriptionText)
+
+    Dim descLower
+    descLower = LCase(CStr(descriptionText))
+
+    If InStr(descLower, "бч") > 0 Then                                             ' БЧ всегда в приоритете
+        DetectCode = "бч"
+        Exit Function
+    End If
+
+    Dim descRules
+    descRules = gCodeRules("descRules")
+    Dim i
+    For i = LBound(descRules) To UBound(descRules)
+        Dim rule
+        rule = descRules(i)
+        Dim kw
+        kw = CStr(rule(0))
+        Dim code
+        code = CStr(rule(1))
+        If kw <> "бч" Then
+            If InStr(descLower, kw) > 0 Then
+                DetectCode = code
+                Exit Function
+            End If
+        End If
+    Next
+
+    Select Case UCase(kindValue)
+        Case "ASM"
+            DetectCode = gCodeRules("base_asm")
+        Case "FAST"
+            DetectCode = gCodeRules("base_fast")
+        Case "PKI"
+            DetectCode = gCodeRules("base_pki")
+        Case "MAT"
+            DetectCode = gCodeRules("base_mat")
+        Case Else
+            DetectCode = gCodeRules("base_part")
+    End Select
+
+End Function                                                                        ' Конец DetectCode
+
+
+Function ShouldHideNonDrawingPart(descriptionText, materialName)
+
+    If gNonDrawingPartsAsMaterials = False Then
+        ShouldHideNonDrawingPart = False
+        Exit Function
+    End If
+
+    Dim descLower
+    descLower = LCase(CStr(descriptionText))
+    If InStr(descLower, "бч") = 0 Then
+        ShouldHideNonDrawingPart = False
+        Exit Function
+    End If
+
+    Dim matLower
+    matLower = LCase(CStr(materialName))
+    ShouldHideNonDrawingPart = IsFabricMaterial(matLower)
+
+End Function                                                                        ' Конец ShouldHideNonDrawingPart
 
 
 ' -----------------------------                                                    ' Раздел комментария
@@ -794,6 +1055,267 @@ Function FileExists(path)
     FileExists = fso.FileExists(path)                                              ' Проверяем существование
 
 End Function                                                                        ' Конец FileExists
+
+
+Function ReadTextFileUtf8Safe(path)
+
+    Dim fso                                                                        ' FileSystemObject для чтения файла
+    Set fso = CreateObject("Scripting.FileSystemObject")                           ' Создаём FSO
+
+    If fso.FileExists(path) = False Then                                           ' Если файла нет
+        ReadTextFileUtf8Safe = ""                                                  ' Возвращаем пустую строку
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки файла
+
+    Dim ts                                                                         ' Текстовый поток
+    Set ts = fso.OpenTextFile(path, 1, False)                                      ' Открываем на чтение (кодировка по умолчанию системы)
+    ReadTextFileUtf8Safe = ts.ReadAll                                              ' Читаем весь файл
+    ts.Close                                                                       ' Закрываем поток
+
+End Function                                                                        ' Конец ReadTextFileUtf8Safe
+
+
+Function DefaultProjectCodes()
+
+    Dim arr                                                                        ' Массив по умолчанию
+    arr = Array("СГТЕ", "SGTE")                                                    ' Базовые коды проекта (кириллица/латиница)
+    DefaultProjectCodes = arr                                                      ' Возвращаем массив
+
+End Function                                                                        ' Конец DefaultProjectCodes
+
+
+Sub LoadMaterialLibraries(folderPath)
+
+    ' --- Металлы ---
+    Dim metalsPath
+    metalsPath = folderPath & "\metals_ru_library.tsv"
+    Dim metalContent
+    metalContent = ReadTextFileUtf8Safe(metalsPath)
+    Dim metalList()
+    ReDim metalList(-1)
+    If Trim(metalContent) <> "" Then
+        Dim metalLines
+        metalLines = Split(metalContent, vbCrLf)
+        Dim i
+        For i = 1 To UBound(metalLines)                                            ' Пропускаем заголовок
+            Dim ln
+            ln = Trim(metalLines(i))
+            If ln <> "" Then
+                Dim cols
+                cols = Split(ln, vbTab)
+                If UBound(cols) >= 1 Then
+                    Dim mark
+                    mark = Trim(cols(1))
+                    Dim idx
+                    idx = ArrayLastIndex(metalList) + 1
+                    ReDim Preserve metalList(idx)
+                    metalList(idx) = mark
+                End If
+            End If
+        Next
+    End If
+    gMetalMarks = metalList
+
+    ' --- Композиты/армирование ---
+    Dim compPath
+    compPath = folderPath & "\composites_detect_keywords.tsv"
+    Dim compContent
+    compContent = ReadTextFileUtf8Safe(compPath)
+    Dim compList()
+    Dim fabricList()
+    ReDim compList(-1)
+    ReDim fabricList(-1)
+    If Trim(compContent) <> "" Then
+        Dim compLines
+        compLines = Split(compContent, vbCrLf)
+        Dim j
+        For j = 1 To UBound(compLines)                                             ' Пропускаем заголовок
+            Dim cln
+            cln = Trim(compLines(j))
+            If cln <> "" Then
+                Dim ccols
+                ccols = Split(cln, vbTab)
+                If UBound(ccols) >= 2 Then
+                    Dim grp
+                    grp = LCase(Trim(ccols(0)))
+                    Dim tag
+                    tag = LCase(Trim(ccols(1)))
+                    Dim mode
+                    mode = LCase(Trim(ccols(2)))
+
+                    Dim idxComp
+                    idxComp = ArrayLastIndex(compList) + 1
+                    ReDim Preserve compList(idxComp)
+                    compList(idxComp) = Array(grp, tag, mode)
+
+                    If InStr(grp, "армир") > 0 Then
+                        Dim idxFab
+                        idxFab = ArrayLastIndex(fabricList) + 1
+                        ReDim Preserve fabricList(idxFab)
+                        fabricList(idxFab) = Array(grp, tag, mode)
+                    End If
+                End If
+            End If
+        Next
+    End If
+    gCompositeKeywords = compList
+    gFabricKeywords = fabricList
+
+End Sub                                                                            ' Конец LoadMaterialLibraries
+
+
+Sub LoadSettings(settingsPath, ByRef projectCodes, ByRef repeatSubassemblies, ByRef nonDrawingAsMaterials, ByRef massStd, ByRef massPki)
+
+    Dim content                                                                   ' Содержимое файла настроек
+    content = ReadTextFileUtf8Safe(settingsPath)                                  ' Пробуем прочитать текст
+
+    If Trim(content) = "" Then                                                    ' Если файл пустой или не найден
+        Exit Sub                                                                  ' Используем значения по умолчанию
+    End If                                                                        ' Конец проверки содержимого
+
+    Dim lines                                                                     ' Массив строк файла
+    lines = Split(content, vbCrLf)                                                ' Делим по переводам строк
+
+    Dim i                                                                        ' Счётчик строк
+    For i = LBound(lines) To UBound(lines)                                        ' Перебираем каждую строку
+
+        Dim line                                                                 ' Текущая строка
+        line = Trim(lines(i))                                                     ' Обрезаем пробелы
+
+        If line <> "" Then                                                        ' Пустые строки пропускаем
+
+            Dim posEq                                                            ' Позиция знака '='
+            posEq = InStr(line, "=")                                             ' Ищем '='
+
+            If posEq > 0 Then                                                     ' Если нашли
+
+                Dim key                                                          ' Имя настройки
+                key = Trim(Left(line, posEq - 1))                                 ' Берём часть до '='
+
+                Dim valueRaw                                                      ' Необработанное значение
+                valueRaw = Trim(Mid(line, posEq + 1))                             ' Берём часть после '='
+
+                Select Case LCase(key)                                           ' Смотрим имя настройки
+                    Case "project_code"                                         ' Настройка кодов проекта
+
+                        valueRaw = Replace(valueRaw, "'", "")                   ' Убираем кавычки
+                        valueRaw = Replace(valueRaw, "\"", "")                 ' Убираем обратные слэши
+                        valueRaw = Replace(valueRaw, " or ", ",", 1, -1, vbTextCompare) ' Заменяем "or" на запятую
+
+                        Dim parts                                                ' Части списка
+                        parts = Split(valueRaw, ",")                             ' Делим по запятой
+
+                        Dim cleaned()                                            ' Очищенный список
+                        Dim c                                                    ' Счётчик очищенных
+                        c = -1                                                    ' Начинаем с -1 для ReDim Preserve
+
+                        Dim j                                                    ' Счётчик по частям
+                        For j = LBound(parts) To UBound(parts)                    ' Перебираем элементы
+                            Dim item                                             ' Элемент списка
+                            item = Trim(parts(j))                                ' Trim каждого элемента
+                            If item <> "" Then                                  ' Пропускаем пустые
+                                c = c + 1                                        ' Увеличиваем счётчик
+                                ReDim Preserve cleaned(c)                        ' Расширяем массив
+                                cleaned(c) = item                                ' Кладём значение
+                            End If                                               ' Конец проверки пустоты
+                        Next                                                     ' Следующий элемент
+
+                        If c >= 0 Then                                           ' Если собрали хоть одно значение
+                            projectCodes = cleaned                               ' Подменяем глобальный список
+                        End If                                                   ' Конец проверки количества
+
+                    Case "repeating_subassemblies_in_tree"                      ' Флаг разворачивать подсборки
+
+                        repeatSubassemblies = (LCase(valueRaw) = "true")        ' True если явно указано true
+
+                    Case "non-drawing_parts_as_materials"                      ' Флаг БЧ-тканей как материалов
+
+                        nonDrawingAsMaterials = (LCase(valueRaw) = "true")      ' True если явно указано true
+
+                    Case "mass_of_standard_parts"                              ' Показывать массу стандартных изделий
+
+                        massStd = (LCase(valueRaw) = "true")                   ' True если явно указано true
+
+                    Case "mass_of_pki"                                         ' Показывать массу ПКИ
+
+                        massPki = (LCase(valueRaw) = "true")                   ' True если явно указано true
+
+                End Select                                                       ' Конец выбора по ключу
+
+            End If                                                               ' Конец проверки на '='
+
+        End If                                                                   ' Конец проверки пустой строки
+
+    Next                                                                         ' Следующая строка настроек
+
+End Sub                                                                          ' Конец LoadSettings
+
+
+Function LoadCodeRules(codePath)
+
+    Dim rules
+    Set rules = CreateObject("Scripting.Dictionary")
+
+    rules.Add "base_asm", "сб"                                                      ' Значение по умолчанию для сборок
+    rules.Add "base_part", "д"                                                     ' Значение по умолчанию для деталей
+    rules.Add "base_fast", "креп"                                                  ' Значение по умолчанию для крепежа
+    rules.Add "base_pki", "пок"                                                    ' Значение по умолчанию для ПКИ (если нет кода — возьмём пок для закупок)
+    rules.Add "base_mat", "мат"                                                    ' Значение по умолчанию для материалов
+
+    Dim descRules()
+    ReDim descRules(-1)
+
+    Dim content
+    content = ReadTextFileUtf8Safe(codePath)
+
+    If Trim(content) <> "" Then
+        Dim lines
+        lines = Split(content, vbCrLf)
+        Dim i
+        For i = LBound(lines) To UBound(lines)
+            Dim ln
+            ln = Trim(lines(i))
+            If ln <> "" Then
+                Dim cols
+                cols = Split(ln, vbTab)
+                If UBound(cols) >= 1 Then
+                    Dim code
+                    code = Trim(cols(0))
+                    Dim label
+                    label = LCase(Trim(cols(1)))
+                    Dim isDesc
+                    isDesc = False
+                    If UBound(cols) >= 2 Then
+                        isDesc = (LCase(Trim(cols(2))) = "description")
+                    End If
+
+                    If InStr(label, "сборка") > 0 Then
+                        rules("base_asm") = code
+                    ElseIf InStr(label, "деталь") > 0 Then
+                        rules("base_part") = code
+                    ElseIf InStr(label, "креп") > 0 Then
+                        rules("base_fast") = code
+                    ElseIf InStr(label, "пки") > 0 Or InStr(label, "покуп") > 0 Then
+                        rules("base_pki") = code
+                    ElseIf InStr(label, "материал") > 0 Then
+                        rules("base_mat") = code
+                    End If
+
+                    If isDesc = True Then
+                        Dim idx
+                        idx = ArrayLastIndex(descRules) + 1
+                        ReDim Preserve descRules(idx)
+                        descRules(idx) = Array(LCase(code), code)                 ' keyword=code, value=code
+                    End If
+                End If
+            End If
+        Next
+    End If
+
+    rules.Add "descRules", descRules
+    Set LoadCodeRules = rules
+
+End Function                                                                      ' Конец LoadCodeRules
 
 
 Function GetFolderFromFullPath(fullPath)
