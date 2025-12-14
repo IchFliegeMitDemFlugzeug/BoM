@@ -1,5 +1,11 @@
 Option Explicit                                                                 ' Требуем явного объявления переменных (меньше “магических” ошибок)
 
+Dim gProjectCodePrefixes                                                         ' Массив префиксов проекта (в нижнем регистре)
+Dim gRepeatingSubassembliesInTree                                                ' Флаг: повторять подсборки в дереве (из Settings.txt)
+Dim gNonDrawingPartsAsMaterials                                                  ' Флаг: скрывать БЧ-ткань как материалы (из Settings.txt)
+Dim gMassOfStandardParts                                                         ' Флаг: показывать массу стандартных изделий (из Settings.txt)
+Dim gMassOfPKI                                                                   ' Флаг: показывать массу ПКИ (из Settings.txt)
+
 ' -----------------------------                                                    ' Раздел комментария
 ' Точка входа макроса CATIA                                                        ' Описание
 ' -----------------------------                                                    ' Раздел комментария
@@ -48,6 +54,10 @@ Sub CATMain()                                                                   
                "Положи ExcelBuilder.vbs рядом с тем местом, куда сохраняешь Excel.", vbExclamation, "BOM Extract" ' Подсказка
         Exit Sub                                                                  ' Выходим
     End If                                                                        ' Конец проверки ExcelBuilder
+
+    If LoadSettingsFromFile(workFolder) = False Then                              ' Пробуем прочитать Settings.txt (A1)
+        Exit Sub                                                                  ' Если не смогли — выходим
+    End If                                                                        ' Конец проверки загрузки настроек
 
     Dim payloadPath                                                               ' Путь к промежуточному payload
     payloadPath = workFolder & "\BOM_payload.tsv"                                 ' Payload кладём рядом
@@ -762,6 +772,180 @@ Function AppendLineReturnIndex(ByRef arr, line)
     End If                                                                         ' Конец ветвления
 
 End Function                                                                        ' Конец AppendLineReturnIndex
+
+
+' -----------------------------                                                    ' Раздел комментария
+' Загрузка настроек из Settings.txt                                                 ' Описание
+' -----------------------------                                                    ' Раздел комментария
+Function LoadSettingsFromFile(workFolder)
+
+    Dim settingsPath                                                               ' Полный путь к Settings.txt
+    settingsPath = workFolder & "\Settings.txt"                                   ' Файл настроек лежит рядом с выгрузкой
+
+    If FileExists(settingsPath) = False Then                                       ' Если Settings.txt нет
+        MsgBox "Не найден Settings.txt в папке:" & vbCrLf & workFolder & vbCrLf & _
+               "Положи Settings.txt рядом со скриптами и попробуй снова.", vbExclamation, "BOM Extract" ' Понятное сообщение и подсказка
+        LoadSettingsFromFile = False                                               ' Сообщаем об ошибке загрузки
+        Exit Function                                                              ' Выходим из функции
+    End If                                                                        ' Конец проверки наличия файла
+
+    gProjectCodePrefixes = Array()                                                 ' Сбрасываем массив префиксов проекта
+    gRepeatingSubassembliesInTree = False                                          ' Дефолт: подсборки суммируются
+    gNonDrawingPartsAsMaterials = False                                            ' Дефолт: БЧ-ткань показываем как детали
+    gMassOfStandardParts = False                                                   ' Дефолт: массы стандарта не отображаем
+    gMassOfPKI = False                                                             ' Дефолт: массы ПКИ не отображаем
+
+    Dim readOk                                                                    ' Флаг успешного чтения файла
+    readOk = False                                                                ' Инициализируем ложью
+
+    Dim settingsContent                                                           ' Содержимое файла настроек
+    settingsContent = ReadAllText(settingsPath, readOk)                           ' Пробуем прочитать файл целиком
+
+    If readOk = False Then                                                        ' Если прочитать не удалось
+        MsgBox "Не удалось прочитать Settings.txt:" & vbCrLf & settingsPath, vbExclamation, "BOM Extract" ' Сообщаем пользователю
+        LoadSettingsFromFile = False                                               ' Возвращаем ошибку
+        Exit Function                                                              ' Выходим
+    End If                                                                        ' Конец проверки чтения
+
+    Dim normalizedText                                                            ' Текст с нормализованными переводами строк
+    normalizedText = Replace(settingsContent, vbCrLf, vbLf)                       ' Приводим CRLF к LF
+    normalizedText = Replace(normalizedText, vbCr, vbLf)                          ' Убираем одиночные CR
+
+    Dim rows                                                                      ' Массив строк файла
+    rows = Split(normalizedText, vbLf)                                            ' Делим файл по строкам
+
+    Dim i                                                                         ' Счётчик строк
+    For i = 0 To UBound(rows)                                                     ' Перебираем строки настроек
+
+        Dim line                                                                  ' Текущая строка
+        line = Trim(CStr(rows(i)))                                                ' Обрезаем пробелы вокруг
+
+        If line = "" Then                                                        ' Пустые строки пропускаем
+            ' Пропуск                                                            ' Пояснение
+        ElseIf InStr(line, "=") = 0 Then                                         ' Если нет разделителя ключ=значение
+            ' Пропуск                                                            ' Пояснение
+        Else                                                                      ' Нашли потенциальную пару ключ=значение
+
+            Dim eqPos                                                             ' Позиция символа "="
+            eqPos = InStr(line, "=")                                            ' Ищем индекс разделителя
+
+            Dim keyText                                                           ' Имя параметра
+            keyText = Trim(Left(line, eqPos - 1))                                 ' Берём часть слева от "=" и чистим
+
+            Dim valueText                                                         ' Текст значения параметра
+            valueText = Trim(Mid(line, eqPos + 1))                                ' Берём часть справа и чистим
+
+            Select Case LCase(keyText)                                            ' Определяем параметр по имени
+                Case "project_code"                                              ' Список префиксов проекта
+                    gProjectCodePrefixes = ParseProjectCodeList(valueText)        ' Парсим список в массив
+                Case "repeating_subassemblies_in_tree"                           ' Флаг повторения подсборок
+                    gRepeatingSubassembliesInTree = ParseFlexibleBoolean(valueText) ' Конвертируем строку в bool
+                Case "non-drawing_parts_as_materials"                            ' Флаг скрытия БЧ-ткань
+                    gNonDrawingPartsAsMaterials = ParseFlexibleBoolean(valueText) ' Конвертируем строку в bool
+                Case "mass_of_standard_parts"                                    ' Флаг показа массы стандарта
+                    gMassOfStandardParts = ParseFlexibleBoolean(valueText)        ' Конвертируем строку в bool
+                Case "mass_of_pki"                                               ' Флаг показа массы ПКИ
+                    gMassOfPKI = ParseFlexibleBoolean(valueText)                  ' Конвертируем строку в bool
+                Case Else                                                         ' Неизвестный параметр
+                    ' Пропускаем неизвестные строки                              ' Пояснение
+            End Select                                                            ' Конец выбора по имени параметра
+
+        End If                                                                    ' Конец проверки строки
+
+    Next                                                                          ' Переходим к следующей строке
+
+    LoadSettingsFromFile = True                                                   ' Сообщаем об успешной загрузке
+
+End Function                                                                       ' Конец LoadSettingsFromFile
+
+
+Function ReadAllText(path, ByRef isOk)
+
+    On Error Resume Next                                                           ' Перехватываем возможные ошибки
+
+    isOk = False                                                                   ' По умолчанию чтение неуспешно
+
+    Dim fso                                                                        ' FileSystemObject
+    Set fso = CreateObject("Scripting.FileSystemObject")                           ' Создаём FSO
+
+    Dim f                                                                          ' Текстовый файл
+    Set f = fso.OpenTextFile(path, 1, False)                                       ' Открываем на чтение (без автосоздания)
+
+    If Err.Number <> 0 Then                                                        ' Если открыть файл не удалось
+        Err.Clear                                                                  ' Чистим ошибку
+        ReadAllText = ""                                                          ' Возвращаем пустую строку
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки открытия
+
+    Dim t                                                                          ' Содержимое файла
+    t = f.ReadAll                                                                  ' Читаем весь текст
+    f.Close                                                                        ' Закрываем файл
+
+    isOk = True                                                                    ' Отмечаем, что чтение прошло успешно
+    ReadAllText = CStr(t)                                                          ' Возвращаем текст как строку
+
+    On Error GoTo 0                                                                ' Снимаем перехват
+
+End Function                                                                        ' Конец ReadAllText
+
+
+Function ParseFlexibleBoolean(rawValue)
+
+    Dim t                                                                          ' Рабочая строка со значением
+    t = LCase(Trim(CStr(rawValue)))                                                ' Нормализуем регистр и пробелы
+
+    t = Replace(t, Chr(34), " ")                                                  ' Убираем двойные кавычки
+    t = Replace(t, "'", " ")                                                     ' Убираем одинарные кавычки
+    t = Replace(t, vbTab, " ")                                                    ' Заменяем табы на пробелы
+    t = Replace(t, vbCr, " ")                                                     ' Убираем CR
+    t = Replace(t, vbLf, " ")                                                     ' Убираем LF
+
+    If InStr(t, " ") > 0 Then                                                     ' Если есть пробелы внутри
+        t = Split(t, " ")(0)                                                      ' Берём первое слово (до комментариев)
+    End If                                                                         ' Конец обработки пробелов
+
+    ParseFlexibleBoolean = (t = "true" Or t = "1" Or t = "yes" Or t = "y" Or t = "да") ' Преобразуем в булево
+
+End Function                                                                        ' Конец ParseFlexibleBoolean
+
+
+Function ParseProjectCodeList(rawValue)
+
+    Dim prepared                                                                   ' Текст, подготовленный к разбору
+    prepared = CStr(rawValue)                                                      ' Приводим к строке
+    prepared = Replace(prepared, Chr(34), " ")                                    ' Убираем двойные кавычки
+    prepared = Replace(prepared, "'", " ")                                       ' Убираем одинарные кавычки
+    prepared = Replace(prepared, vbCr, " ")                                       ' Убираем CR
+    prepared = Replace(prepared, vbLf, " ")                                       ' Убираем LF
+    prepared = Replace(prepared, vbTab, " ")                                      ' Заменяем табуляции
+    prepared = Replace(prepared, ";", " ")                                       ' Заменяем точки с запятой на пробелы
+    prepared = Replace(prepared, ",", " ")                                       ' Заменяем запятые на пробелы
+    prepared = Replace(prepared, "|", " ")                                       ' Заменяем вертикальные черты
+    prepared = Replace(prepared, "/", " ")                                       ' Заменяем косые черты
+
+    prepared = LCase(prepared)                                                     ' Переводим в нижний регистр
+    prepared = Replace(prepared, " or ", " ")                                    ' Поддержка разделителя OR
+    prepared = Replace(prepared, "или", " ")                                     ' Поддержка русскоязычного "или"
+    prepared = Replace(prepared, "and", " ")                                     ' Убираем слово AND, если вдруг встретится
+
+    Dim parts                                                                      ' Части строки после split
+    parts = Split(prepared, " ")                                                  ' Делим по пробелам
+
+    Dim arr                                                                        ' Результирующий массив префиксов
+    arr = Array()                                                                  ' Начинаем с пустого массива
+
+    Dim i                                                                          ' Счётчик частей
+    For i = 0 To UBound(parts)                                                     ' Перебираем все элементы
+        Dim p                                                                      ' Текущий фрагмент
+        p = Trim(CStr(parts(i)))                                                   ' Чистим пробелы
+        If p <> "" Then                                                           ' Игнорируем пустые элементы
+            arr = ArrayAppendValue(arr, p)                                         ' Добавляем префикс в массив
+        End If                                                                     ' Конец проверки пустоты
+    Next                                                                           ' Следующий элемент
+
+    ParseProjectCodeList = arr                                                     ' Возвращаем массив префиксов
+
+End Function                                                                        ' Конец ParseProjectCodeList
 
 
 ' -----------------------------                                                    ' Раздел комментария
