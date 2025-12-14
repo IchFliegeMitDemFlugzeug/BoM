@@ -16,6 +16,7 @@ Const COL_Q_MASS_TOTAL = 17                                                     
 Dim payloadPath                                                                    ' Путь к TSV payload (передаёт CATScript)
 Dim outXlsx                                                                        ' Путь к итоговому Excel .xlsx
 Dim startLevel                                                                     ' Стартовый G-уровень (1..8), который передаёт CATScript
+Dim codesList                                                                      ' Массив кодов из Code.tsv для валидации списка
 
 ' -----------------------------                                                    ' Проверяем аргументы запуска (их должен передать CATScript)
 If WScript.Arguments.Count < 3 Then                                               ' Если аргументов меньше 3
@@ -39,6 +40,9 @@ If Len(Trim(text)) = 0 Then                                                     
     WScript.Echo "Payload is empty: " & payloadPath                               ' Сообщаем в консоль WSH
     WScript.Quit 2                                                                ' Завершаем работу с ошибкой
 End If                                                                            ' Конец проверки payload
+
+' -----------------------------                                                    ' Загружаем Code.tsv для выпадающего списка
+codesList = LoadCodeList(payloadPath)                                             ' Читаем первый столбец Code.tsv (рядом со скриптом/payload)
 
 Dim lines                                                                          ' Массив строк payload
 lines = Split(text, vbCrLf)                                                       ' Делим текст на строки по CRLF
@@ -114,7 +118,7 @@ For i = 1 To UBound(lines)                                                      
         parentPN = SafeField(f, 5)                                                 ' Берём ParentPN
 
         Dim qty                                                                    ' Количество (идёт в L)
-        qty = ParseLong(SafeField(f, 6))                                           ' Парсим Qty
+        qty = ParseLocaleNumber(SafeField(f, 6))                                   ' Парсим Qty/массу с сохранением дробной части
 
         Dim codeM                                                                  ' Код (идёт в M)
         codeM = SafeField(f, 7)                                                    ' Берём CodeM
@@ -136,7 +140,7 @@ For i = 1 To UBound(lines)                                                      
         Call CloseAsmGroups(ws, stackDepth, stackRow, sp, depth, row - 1)          ' Закрываем все сборки глубже текущей глубины
 
         ' -----------------------------                                            ' Записываем строку данных в Excel
-        Call WriteExcelRow(ws, row, depth, startLevel, label, defText, parentPN, qty, codeM, typeN, matO, massEach, massTotal) ' Заполняем ячейки строки
+        Call WriteExcelRow(ws, row, depth, startLevel, label, defText, parentPN, qty, codeM, typeN, matO, massEach, massTotal, UCase(kind) = "ASM") ' Заполняем ячейки строки
 
         ' -----------------------------                                            ' Если строка — это сборка, то добавляем её в стек
         If UCase(kind) = "ASM" Then                                               ' Если Kind = ASM (подсборка/сборка)
@@ -154,6 +158,9 @@ Call CloseAsmGroups(ws, stackDepth, stackRow, sp, -1, row - 1)                  
 
 Dim lastRow                                                                       ' Последняя заполненная строка Excel
 lastRow = row - 1                                                                 ' Вычисляем последнюю строку данных
+
+' -----------------------------                                                    ' Вешаем Data Validation (List) на колонку "код"
+Call ApplyCodeValidation(ws, lastRow, codesList)                                  ' Ограничиваем ввод в M выпадающим списком Code.tsv
 
 ' -----------------------------                                                    ' Включаем фильтр по шапке (строка 1)
 ws.Range(ws.Cells(1, 1), ws.Cells(1, COL_Q_MASS_TOTAL)).AutoFilter                ' AutoFilter на диапазон A1:Q1
@@ -208,7 +215,7 @@ End Sub                                                                         
 
 ' ============================================================================= ' Раздел: ЗАПИСЬ ОДНОЙ СТРОКИ EXCEL
 ' =============================================================================
-Sub WriteExcelRow(ws, rowIndex, depth, startLevel, labelValue, defText, parentPN, qty, codeM, typeN, matO, massEach, massTotal)
+Sub WriteExcelRow(ws, rowIndex, depth, startLevel, labelValue, defText, parentPN, qty, codeM, typeN, matO, massEach, massTotal, isAsm)
 
     ' Формула в A: для быстрого поиска собираем все G-уровни в одну строку         ' Пояснение
     ws.Cells(rowIndex, COL_A_FIND).Formula = "=CONCATENATE(B" & rowIndex & ",C" & rowIndex & ",D" & rowIndex & ",E" & rowIndex & ",F" & rowIndex & ",G" & rowIndex & ",H" & rowIndex & ",I" & rowIndex & ")" ' A
@@ -234,6 +241,15 @@ Sub WriteExcelRow(ws, rowIndex, depth, startLevel, labelValue, defText, parentPN
     ws.Cells(rowIndex, COL_O_MAT).Value = matO                                    ' O: Материал
     ws.Cells(rowIndex, COL_P_MASS_EACH).Value = massEach                          ' P: Масса 1 шт
     ws.Cells(rowIndex, COL_Q_MASS_TOTAL).Value = massTotal                        ' Q: Суммарная масса
+
+    Dim fillRange                                                                 ' Диапазон для заливки серым
+    Set fillRange = ws.Range(ws.Cells(rowIndex, 1), ws.Cells(rowIndex, COL_Q_MASS_TOTAL)) ' Берём диапазон A..Q текущей строки
+
+    If CBool(isAsm) Then                                                          ' Если строка является сборкой/подсборкой
+        fillRange.Interior.Color = GrayByDepth(depth)                             ' Красим фон по градиенту серого в зависимости от глубины
+    Else                                                                          ' Если строка не ASM (деталь/материал/крепёж/ПКИ)
+        fillRange.Interior.ColorIndex = -4142                                     ' Сбрасываем заливку (xlColorIndexNone)
+    End If                                                                        ' Конец проверки типа строки
 
 End Sub                                                                            ' Конец WriteExcelRow
 
@@ -286,6 +302,10 @@ Sub FormatSheet(ws, lastRow)
     ws.Columns("P").ColumnWidth = 12                                              ' Ширина P
     ws.Columns("Q").ColumnWidth = 14                                              ' Ширина Q
 
+    ws.Columns("L").NumberFormat = "0.000"                                        ' Формат количества/массы с дробной частью
+    ws.Columns("P").NumberFormat = "0.000"                                        ' Формат массы 1 шт. как числа с дробью
+    ws.Columns("Q").NumberFormat = "0.000"                                        ' Формат суммарной массы как числа с дробью
+
     ' -----------------------------                                                ' Перенос текста в заголовках и оформление шапки
     Dim hdr                                                                       ' Диапазон шапки A1:Q1
     Set hdr = ws.Range(ws.Cells(1, 1), ws.Cells(1, COL_Q_MASS_TOTAL))             ' Берём диапазон шапки
@@ -322,6 +342,63 @@ Sub FormatSheet(ws, lastRow)
     ws.Outline.ShowLevels 8, 8                                                    ' Показать максимально (строки/столбцы)
 
 End Sub                                                                            ' Конец FormatSheet
+
+
+' ============================================================================= ' Раздел: DATA VALIDATION ДЛЯ "код" (КОЛОНКА M)
+' =============================================================================
+Sub ApplyCodeValidation(ws, lastRow, codes)
+
+    If CLng(lastRow) < 2 Then                                                      ' Если нет строк данных, выходим
+        Exit Sub                                                                  ' Нечего валидировать
+    End If                                                                        ' Конец проверки наличия строк данных
+
+    If IsArray(codes) = False Then                                                ' Если список кодов не массив
+        Exit Sub                                                                  ' Прерываем установку валидации
+    End If                                                                        ' Конец проверки типа codes
+
+    If UBound(codes) < 0 Then                                                     ' Если массив пустой
+        Exit Sub                                                                  ' Нет кодов — нет списка
+    End If                                                                        ' Конец проверки пустого массива
+
+    Dim wb                                                                        ' Объект книги, чтобы добавить скрытый лист
+    Set wb = ws.Parent                                                            ' Берём родительскую книгу из листа
+
+    Dim refWsName                                                                 ' Имя служебного листа со списком кодов
+    refWsName = "ref_codes"                                                       ' Фиксированное имя для повторных запусков
+
+    Dim refWs                                                                     ' Лист со значениями для выпадающего списка
+    On Error Resume Next                                                          ' Перехватываем возможные ошибки поиска листа
+    Set refWs = wb.Worksheets(refWsName)                                          ' Пытаемся получить существующий лист
+    On Error GoTo 0                                                               ' Возвращаем обычную обработку ошибок
+
+    If refWs Is Nothing Then                                                      ' Если листа нет
+        Set refWs = wb.Worksheets.Add                                             ' Создаём новый лист
+        On Error Resume Next                                                      ' Возможен конфликт имени — ловим
+        refWs.Name = refWsName                                                    ' Присваиваем имя
+        On Error GoTo 0                                                           ' Возвращаем обработку ошибок
+    Else                                                                          ' Если лист уже есть
+        refWs.Cells.Clear                                                         ' Чистим предыдущие данные списка
+    End If                                                                        ' Конец создания/очистки листа
+
+    Dim i                                                                         ' Счётчик для выгрузки кодов в столбец A
+    For i = 0 To UBound(codes)                                                    ' Проходим по массиву кодов
+        refWs.Cells(i + 1, 1).Value = codes(i)                                    ' Пишем код в A{строка}
+    Next                                                                          ' Следующий код
+
+    refWs.Visible = 2                                                             ' Делаем лист very hidden, чтобы не мешал
+
+    Dim valRange                                                                  ' Диапазон колонок M со 2-й строки до lastRow
+    Set valRange = ws.Range(ws.Cells(2, COL_M_CODE), ws.Cells(lastRow, COL_M_CODE)) ' Формируем диапазон для валидации
+
+    valRange.Validation.Delete                                                    ' Сносим предыдущую валидацию на всякий случай
+
+    Dim listFormula                                                               ' Формула для списка (ссылка на A1:A{n})
+    listFormula = "=" & refWsName & "!$A$1:$A$" & CStr(UBound(codes) + 1)        ' Собираем адрес диапазона списка
+
+    valRange.Validation.Add 3, 1, 1, listFormula                                  ' Добавляем Data Validation: Type=List, Stop
+    valRange.Validation.IgnoreBlank = True                                        ' Разрешаем пустые значения (для старых данных)
+
+End Sub                                                                            ' Конец ApplyCodeValidation
 
 
 ' ============================================================================= ' Раздел: UNICODE-ЧТЕНИЕ PAYLOAD (UTF-16 LE)
@@ -417,3 +494,132 @@ Function RGBLong(r, g, b)
     RGBLong = CLng(r) + CLng(g) * 256 + CLng(b) * 65536                           ' Возвращаем Long-цвет
 
 End Function                                                                      ' Конец RGBLong
+
+
+Function GrayByDepth(depth)
+
+    Dim minGray                                                                   ' Минимальная насыщенность серого для корня
+    minGray = 170                                                                 ' Делает верхние уровни заметно темнее
+
+    Dim stepGray                                                                  ' Шаг осветления на каждый уровень глубже
+    stepGray = 12                                                                 ' Чем глубже, тем светлее
+
+    Dim maxGray                                                                   ' Максимальная насыщенность (самый светлый)
+    maxGray = 240                                                                 ' Ограничиваем, чтобы текст оставался читабельным
+
+    Dim intensity                                                                 ' Итоговая интенсивность для конкретного уровня
+    intensity = CLng(minGray) + CLng(depth) * CLng(stepGray)                      ' Стартовый тон + шаг * глубина
+
+    If intensity > maxGray Then intensity = maxGray                               ' Защита от выхода за пределы 0..255
+    If intensity < 0 Then intensity = 0                                           ' Запасной лимит на случай отрицательных уровней
+
+    GrayByDepth = RGBLong(intensity, intensity, intensity)                        ' Возвращаем одинаковые R=G=B для серого цвета
+
+End Function                                                                      ' Конец GrayByDepth
+
+
+Function LoadCodeList(payloadPath)
+
+    Dim fso                                                                       ' FileSystemObject для работы с путями
+    Set fso = CreateObject("Scripting.FileSystemObject")                         ' Создаём FSO
+
+    Dim codePath                                                                  ' Путь к файлу Code.tsv
+    codePath = ResolveCodePath(fso, payloadPath)                                  ' Пробуем найти Code.tsv рядом с payload/скриптом
+
+    If codePath = "" Then                                                         ' Если файл не найден
+        LoadCodeList = Array()                                                    ' Возвращаем пустой массив
+        Exit Function                                                             ' Выходим из функции
+    End If                                                                        ' Конец проверки пути
+
+    Dim codeText                                                                  ' Содержимое Code.tsv
+    codeText = ReadUnicodeFile(codePath)                                          ' Читаем файл с кодировкой UTF-16
+
+    If Len(Trim(codeText)) = 0 Then                                               ' Если файл пустой
+        LoadCodeList = Array()                                                    ' Возвращаем пустой массив
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки пустоты
+
+    Dim dict                                                                      ' Словарь для уникальных кодов
+    Set dict = CreateObject("Scripting.Dictionary")                              ' Создаём dictionary
+
+    Dim lines                                                                     ' Строки файла
+    lines = Split(codeText, vbCrLf)                                               ' Делим по CRLF
+
+    Dim i                                                                         ' Счётчик строк Code.tsv
+    For i = 0 To UBound(lines)                                                    ' Проходим все строки
+
+        Dim ln                                                                    ' Текущая строка Code.tsv
+        ln = Trim(lines(i))                                                       ' Обрезаем пробелы
+
+        If ln <> "" Then                                                          ' Пропускаем пустые строки
+
+            Dim parts                                                             ' Поля строки Code.tsv
+            parts = Split(ln, vbTab)                                              ' Делим по табу
+
+            Dim codeKey                                                           ' Ключ кода из первого столбца
+            codeKey = SafeField(parts, 0)                                         ' Берём первое поле безопасно
+
+            If codeKey <> "" Then                                                 ' Если код не пустой
+                If dict.Exists(codeKey) = False Then                              ' Если такого кода ещё нет в словаре
+                    dict.Add codeKey, True                                        ' Добавляем код как ключ
+                End If                                                            ' Конец проверки наличия кода
+            End If                                                                ' Конец проверки пустого кода
+
+        End If                                                                    ' Конец проверки пустой строки
+
+    Next                                                                          ' Следующая строка Code.tsv
+
+    If dict.Count = 0 Then                                                        ' Если ничего не собрали
+        LoadCodeList = Array()                                                    ' Возвращаем пустой массив
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки пустого словаря
+
+    Dim result()                                                                  ' Итоговый массив кодов
+    ReDim result(dict.Count - 1)                                                  ' Резервируем нужный размер
+
+    Dim idx                                                                       ' Индекс для заполнения массива
+    idx = 0                                                                       ' Стартуем с 0
+
+    Dim key                                                                      ' Переменная для перебора ключей словаря
+    For Each key In dict.Keys                                                     ' Обходим все собранные коды
+        result(idx) = CStr(key)                                                   ' Записываем код как строку
+        idx = idx + 1                                                             ' Увеличиваем индекс
+    Next                                                                          ' Следующий код
+
+    LoadCodeList = result                                                         ' Возвращаем массив кодов
+
+End Function                                                                      ' Конец LoadCodeList
+
+
+Function ResolveCodePath(fso, payloadPath)
+
+    On Error Resume Next                                                          ' Перехват ошибок доступа к файлам
+
+    Dim payloadFolder                                                             ' Папка, где лежит payload.tsv
+    payloadFolder = fso.GetParentFolderName(payloadPath)                          ' Получаем путь к директории payload
+
+    Dim tryPath                                                                   ' Промежуточный путь для проверок
+    tryPath = fso.BuildPath(payloadFolder, "Code.tsv")                           ' Пробуем поискать Code.tsv рядом с payload
+
+    If fso.FileExists(tryPath) Then                                               ' Если файл найден у payload
+        ResolveCodePath = tryPath                                                 ' Возвращаем путь
+        On Error GoTo 0                                                           ' Сбрасываем обработку ошибок
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки у payload
+
+    Dim scriptFolder                                                              ' Папка, где лежит сам скрипт
+    scriptFolder = fso.GetParentFolderName(WScript.ScriptFullName)                ' Получаем каталог ExcelBuilder
+
+    tryPath = fso.BuildPath(scriptFolder, "Code.tsv")                            ' Пробуем путь рядом со скриптом
+
+    If fso.FileExists(tryPath) Then                                               ' Если нашли
+        ResolveCodePath = tryPath                                                 ' Возвращаем путь
+        On Error GoTo 0                                                           ' Сбрасываем обработку ошибок
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки у скрипта
+
+    ResolveCodePath = ""                                                         ' Не нашли ни в одной папке — возвращаем пусто
+
+    On Error GoTo 0                                                               ' Возвращаем стандартную обработку ошибок
+
+End Function                                                                      ' Конец ResolveCodePath
