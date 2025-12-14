@@ -91,7 +91,6 @@ Sub CATMain()                                                                   
     rootPN = SafeGetPartNumber(rootProd)                                          ' Берём PartNumber корневой сборки
 
     Dim rootDef                                                                   ' Definition корня
-@@ -117,50 +143,53 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)
     ordPKI = Array()                                                              ' ПКИ (прочие)
 
     Dim i                                                                         ' Счётчик детей
@@ -145,7 +144,6 @@ Sub CATMain()                                                                   
 
                     Dim flagSgte                                                   ' Флаг “SGTE/СГТЕ” (имя НЕ конфликтует с функцией IsSGTE)
                     flagSgte = IsSGTE(childPN)                                     ' Вызываем функцию IsSGTE и получаем True/False
-@@ -198,96 +227,150 @@ End Function
 Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, ByRef lines)
 
     Dim addMass                                                                    ' Суммарная масса, которую добавит эта группа
@@ -301,7 +299,6 @@ Sub MeasurePartMaterialAndMass(partDoc, ByRef partMat, ByRef partMassEach)      
 
     Dim oPart                                                                      ' Объект Part
     Set oPart = partDoc.Part                                                       ' Берём Part
-@@ -512,101 +595,165 @@ End Function
 ' -----------------------------                                                    ' Раздел комментария
 ' Definition: берём Definition, иначе Nomenclature/Name                             ' Описание
 ' -----------------------------                                                    ' Раздел комментария
@@ -476,7 +473,6 @@ End Function                                                                    
 
 
 Function IsFabricOrCarbonByMaterial(materialName)
-@@ -622,116 +769,247 @@ Function IsFabricOrCarbonByMaterial(materialName)
     ElseIf InStr(s, "carbon") > 0 Then                                             ' Carbon
         IsFabricOrCarbonByMaterial = True                                          ' Да
     ElseIf InStr(s, "cfrp") > 0 Then                                               ' CFRP
@@ -785,7 +781,6 @@ End Function                                                                    
 
 
 Function CleanTSV(s)
-@@ -774,50 +1052,311 @@ Function WriteAllTextUnicode(path, text)
     Set fso = CreateObject("Scripting.FileSystemObject")                           ' Создаём FSO
     Dim f                                                                          ' Файл
     Set f = fso.CreateTextFile(path, True, True)                                   ' True=overwrite, True=Unicode (UTF-16 LE)
