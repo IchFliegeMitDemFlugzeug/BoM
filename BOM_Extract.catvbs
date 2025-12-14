@@ -122,7 +122,7 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
 
     Dim ordASM, ordSGTE, ordFAST, ordPKI                                          ' Массивы порядка по группам
     ordASM = Array()                                                              ' Подсборки
-    ordSGTE = Array()                                                             ' Детали SGTE/СГТЕ
+    ordSGTE = Array()                                                             ' Детали проекта (по префиксам Project_code)
     ordFAST = Array()                                                             ' Крепёж (DIN/ОСТ)
     ordPKI = Array()                                                              ' ПКИ (прочие)
 
@@ -172,14 +172,14 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
                     ordFAST = ArrayAppendValue(ordFAST, key)                      ' В крепёж
                 Else                                                              ' Иначе — не крепёж
 
-                    Dim flagSgte                                                   ' Флаг “SGTE/СГТЕ” (имя НЕ конфликтует с функцией IsSGTE)
+                Dim flagSgte                                                   ' Флаг “деталь проекта” по Project_code (имя НЕ конфликтует с функцией IsSGTE)
                     flagSgte = IsSGTE(childPN)                                     ' Вызываем функцию IsSGTE и получаем True/False
 
-                    If flagSgte = True Then                                        ' Если это деталь SGTE/СГТЕ
-                        ordSGTE = ArrayAppendValue(ordSGTE, key)                   ' Добавляем позицию в список “SGTE”
+                    If flagSgte = True Then                                        ' Если это “своя” деталь по префиксам Project_code
+                        ordSGTE = ArrayAppendValue(ordSGTE, key)                   ' Добавляем позицию в список “своих” деталей
                     Else                                                           ' Иначе — это ПКИ
                         ordPKI = ArrayAppendValue(ordPKI, key)                     ' Добавляем позицию в список “ПКИ”
-                    End If                                                         ' Конец ветвления SGTE/PKI
+                    End If                                                         ' Конец ветвления “свои детали”/ПКИ
 
                 End If                                                             ' Конец ветвления Fastener/обычный
 
@@ -190,9 +190,9 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
         End If                                                                     ' Конец Exists
     Next                                                                           ' Следующий ребёнок
 
-    ' ---- Вывод в нужном порядке: 1) подсборки 2) SGTE 3) крепёж 4) ПКИ ----      ' Пояснение
+    ' ---- Вывод в нужном порядке: 1) подсборки 2) детали проекта 3) крепёж 4) ПКИ ----      ' Пояснение
     sumMassEach = sumMassEach + EmitGroup(ordASM, "ASM", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' Подсборки
-    sumMassEach = sumMassEach + EmitGroup(ordSGTE, "SGTE", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Детали SGTE
+    sumMassEach = sumMassEach + EmitGroup(ordSGTE, "SGTE", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Детали проекта (по Project_code)
     sumMassEach = sumMassEach + EmitGroup(ordFAST, "FAST", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Крепёж
     sumMassEach = sumMassEach + EmitGroup(ordPKI, "PKI", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' ПКИ
 
@@ -202,7 +202,7 @@ End Function                                                                    
 
 
 ' -----------------------------                                                    ' Раздел комментария
-' Вывод одной группы (ASM/SGTE/FAST/PKI)                                           ' Описание
+' Вывод одной группы (ASM/Project/FAST/PKI)                                        ' Описание
 ' Возвращает вклад массы в родительскую сборку (учитывая qty)                      ' Описание
 ' -----------------------------                                                    ' Раздел комментария
 Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, ByRef lines)
@@ -263,7 +263,7 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 ' Массу ПКИ не считаем                                              ' Пояснение
 
-            Else                                                                   ' Обычная деталь (SGTE/прочее)
+            Else                                                                   ' Обычная деталь (по префиксам Project_code либо прочее)
 
                 Dim partDoc                                                        ' Документ детали
                 Set partDoc = childObj.ReferenceProduct.Parent                     ' Получаем PartDocument
@@ -585,16 +585,33 @@ End Function                                                                    
 ' -----------------------------                                                    ' Раздел комментария
 Function IsSGTE(partNumber)
 
-    Dim s                                                                           ' Нормализованная строка
-    s = UCase(Trim(CStr(partNumber)))                                              ' Приводим к верхнему регистру и обрезаем
+    Dim normalizedPN                                                               ' PartNumber, приведённый к нижнему регистру и без пробелов
+    normalizedPN = LCase(Trim(CStr(partNumber)))                                   ' Чистим исходный PartNumber
 
-    If Left(s, 4) = "SGTE" Then                                                    ' Латинский префикс
-        IsSGTE = True                                                              ' Да
-    ElseIf Left(s, 4) = "СГТЕ" Then                                                ' Кириллический префикс
-        IsSGTE = True                                                              ' Да
-    Else                                                                           ' Иначе
-        IsSGTE = False                                                             ' Нет
-    End If                                                                         ' Конец ветвления
+    Dim ubPrefixes                                                                 ' Индекс последнего префикса из настроек
+    ubPrefixes = ArrayLastIndex(gProjectCodePrefixes)                              ' Проверяем, есть ли что-нибудь в списке Project_code
+
+    If ubPrefixes = -1 Then                                                        ' Если список пуст
+        IsSGTE = False                                                             ' Нечего сопоставлять — считаем позицию “чужой”
+        Exit Function                                                              ' Выходим раньше
+    End If                                                                         ' Конец проверки пустого списка
+
+    Dim i                                                                          ' Счётчик по префиксам
+    For i = 0 To ubPrefixes                                                        ' Перебираем все заданные префиксы
+
+        Dim prefix                                                                 ' Текущий префикс
+        prefix = LCase(Trim(CStr(gProjectCodePrefixes(i))))                        ' Нормализуем префикс из настроек
+
+        If prefix <> "" Then                                                      ' Пустые значения пропускаем
+            If Left(normalizedPN, Len(prefix)) = prefix Then                       ' Если PartNumber начинается с префикса
+                IsSGTE = True                                                      ' Это “своя” деталь/сборка
+                Exit Function                                                      ' Сразу выходим — хватило одного совпадения
+            End If                                                                 ' Конец проверки совпадения
+        End If                                                                     ' Конец проверки пустого префикса
+
+    Next                                                                           ' Следующий префикс
+
+    IsSGTE = False                                                                 ' Если дошли сюда — совпадений не было
 
 End Function                                                                        ' Конец IsSGTE
 
