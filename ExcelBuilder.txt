@@ -12,10 +12,14 @@ Const COL_N_TYPE = 14                                                           
 Const COL_O_MAT = 15                                                              ' Колонка O: "Материал"
 Const COL_P_MASS_EACH = 16                                                        ' Колонка P: "Масса 1 шт. (кг)"
 Const COL_Q_MASS_TOTAL = 17                                                       ' Колонка Q: "Суммарная масса (кг)"
+Const COL_CODES_LIST = 20                                                         ' Вспомогательная скрытая колонка для списка кодов (например, T)
 
 Dim payloadPath                                                                    ' Путь к TSV payload (передаёт CATScript)
 Dim outXlsx                                                                        ' Путь к итоговому Excel .xlsx
 Dim startLevel                                                                     ' Стартовый G-уровень (1..8), который передаёт CATScript
+Dim workFolder                                                                     ' Рабочая папка (рядом лежат Code.tsv и остальные файлы)
+Dim codesList                                                                      ' Массив кодов из Code.tsv для Data Validation
+Dim codesRange                                                                     ' Диапазон на листе с кодами (для Validation списка)
 
 ' -----------------------------                                                    ' Проверяем аргументы запуска (их должен передать CATScript)
 If WScript.Arguments.Count < 3 Then                                               ' Если аргументов меньше 3
@@ -26,6 +30,13 @@ End If                                                                          
 payloadPath = WScript.Arguments(0)                                                ' Берём 1-й аргумент: путь к payload
 outXlsx = WScript.Arguments(1)                                                    ' Берём 2-й аргумент: путь куда сохранить .xlsx
 startLevel = CLng(WScript.Arguments(2))                                           ' Берём 3-й аргумент и приводим к целому (1..8)
+
+Dim fso                                                                            ' FileSystemObject для работы с путями
+Set fso = CreateObject("Scripting.FileSystemObject")                             ' Создаём FSO
+workFolder = fso.GetParentFolderName(payloadPath)                                 ' Рабочая папка = папка, где лежит payload
+If workFolder = "" Then workFolder = "."                                         ' На случай, если путь к payload без каталога
+codesList = LoadCodesFromTsv(workFolder & "\Code.tsv")                          ' Читаем Code.tsv и собираем все значения кодов
+Set codesRange = Nothing                                                           ' Инициализируем ссылку на диапазон кодов
 
 If startLevel < 1 Or startLevel > 8 Then                                          ' Если уровень вне диапазона
     startLevel = 2                                                                ' Делаем безопасный фолбэк: G2
@@ -71,6 +82,7 @@ On Error GoTo 0                                                                 
 
 ' -----------------------------                                                    ' Пишем шапку (строка 1)
 Call WriteHeader(ws)                                                              ' Заполняем заголовки A..Q
+Set codesRange = WriteCodesValidationList(ws, codesList)                          ' Записываем список кодов в скрытую колонку для последующей валидации
 
 Dim row                                                                            ' Текущая строка Excel для записи данных
 row = 2                                                                            ' Данные начинаем со 2-й строки (1-я — шапка)
@@ -114,7 +126,7 @@ For i = 1 To UBound(lines)                                                      
         parentPN = SafeField(f, 5)                                                 ' Берём ParentPN
 
         Dim qty                                                                    ' Количество (идёт в L)
-        qty = ParseLong(SafeField(f, 6))                                           ' Парсим Qty
+        qty = ParseLocaleNumber(SafeField(f, 6))                                   ' Парсим Qty как число с дробной частью (важно для MAT-строк)
 
         Dim codeM                                                                  ' Код (идёт в M)
         codeM = SafeField(f, 7)                                                    ' Берём CodeM
@@ -137,6 +149,7 @@ For i = 1 To UBound(lines)                                                      
 
         ' -----------------------------                                            ' Записываем строку данных в Excel
         Call WriteExcelRow(ws, row, depth, startLevel, label, defText, parentPN, qty, codeM, typeN, matO, massEach, massTotal) ' Заполняем ячейки строки
+        Call ApplyAsmFill(ws, row, depth, kind)                                    ' Если строка сборки — красим её градиентом серого
 
         ' -----------------------------                                            ' Если строка — это сборка, то добавляем её в стек
         If UCase(kind) = "ASM" Then                                               ' Если Kind = ASM (подсборка/сборка)
@@ -160,6 +173,7 @@ ws.Range(ws.Cells(1, 1), ws.Cells(1, COL_Q_MASS_TOTAL)).AutoFilter              
 
 ' -----------------------------                                                    ' Форматируем лист, настраиваем outline и группировку столбцов
 Call FormatSheet(ws, lastRow)                                                     ' Ширины, границы, шапка, outline, freeze panes, группы
+Call ApplyCodeValidation(ws, codesRange, lastRow)                                 ' Вешаем Data Validation (список кодов) на колонку M
 
 ' -----------------------------                                                    ' Сохраняем и закрываем Excel
 wb.SaveAs outXlsx                                                                 ' Сохраняем книгу по заданному пути
@@ -236,6 +250,28 @@ Sub WriteExcelRow(ws, rowIndex, depth, startLevel, labelValue, defText, parentPN
     ws.Cells(rowIndex, COL_Q_MASS_TOTAL).Value = massTotal                        ' Q: Суммарная масса
 
 End Sub                                                                            ' Конец WriteExcelRow
+
+
+' ============================================================================= ' Раздел: ЗАЛИВКА СТРОК СБОРКИ (ГРАДИЕНТ СЕРОГО)
+' =============================================================================
+Sub ApplyAsmFill(ws, rowIndex, depth, kind)
+
+    If UCase(kind) <> "ASM" Then                                                 ' Заливку делаем только для ASM-строк (подсборки/сборки)
+        Exit Sub                                                                   ' Если не ASM — просто выходим
+    End If                                                                         ' Конец проверки типа строки
+
+    Dim shadeBase                                                                  ' Базовая яркость серого
+    shadeBase = 230 - CLng(depth) * 12                                             ' Чем глубже уровень, тем светлее (градиент)
+
+    If shadeBase < 150 Then shadeBase = 150                                       ' Ограничиваем минимальную тёмность
+    If shadeBase > 230 Then shadeBase = 230                                       ' Ограничиваем максимальную светлоту (без белого)
+
+    Dim shadeColor                                                                 ' Итоговый цвет в формате Long
+    shadeColor = RGBLong(shadeBase, shadeBase, shadeBase)                         ' Одинаковые R=G=B дают оттенок серого
+
+    ws.Range(ws.Cells(rowIndex, 1), ws.Cells(rowIndex, COL_Q_MASS_TOTAL)).Interior.Color = shadeColor ' Красим диапазон A..Q строки сборки
+
+End Sub                                                                            ' Конец ApplyAsmFill
 
 
 ' ============================================================================= ' Раздел: ШАПКА ТАБЛИЦЫ (СТРОКА 1)
@@ -324,7 +360,113 @@ Sub FormatSheet(ws, lastRow)
 End Sub                                                                            ' Конец FormatSheet
 
 
-' ============================================================================= ' Раздел: UNICODE-ЧТЕНИЕ PAYLOAD (UTF-16 LE)
+' ============================================================================= ' Раздел: СПИСОК КОДОВ И DATA VALIDATION
+' =============================================================================
+Sub ApplyCodeValidation(ws, codesRange, lastRow)
+
+    If lastRow < 2 Then                                                           ' Если нет строк данных
+        Exit Sub                                                                   ' Нечего валидировать
+    End If                                                                         ' Конец проверки наличия строк
+
+    If codesRange Is Nothing Then                                                 ' Если список кодов не построен
+        Exit Sub                                                                   ' Выходим без валидации (лучше пусто, чем ошибка)
+    End If                                                                         ' Конец проверки диапазона кодов
+
+    Dim targetRange                                                                ' Диапазон M для валидации
+    Set targetRange = ws.Range(ws.Cells(2, COL_M_CODE), ws.Cells(lastRow, COL_M_CODE)) ' Берём M2:M(lastRow)
+
+    targetRange.Validation.Delete                                                 ' Сносим старую валидацию (если была)
+    targetRange.Validation.Add 3, 1, 1, "=" & codesRange.Address(True, True)      ' Добавляем Data Validation List по диапазону кодов
+    targetRange.Validation.IgnoreBlank = True                                     ' Разрешаем пустое значение (как раньше)
+    targetRange.Validation.InCellDropdown = True                                  ' Показываем выпадающий список в ячейке
+
+End Sub                                                                            ' Конец ApplyCodeValidation
+
+
+Function WriteCodesValidationList(ws, codes)
+
+    If IsArray(codes) = False Then                                                ' Если кодов нет или ошибка чтения
+        Set WriteCodesValidationList = Nothing                                     ' Возвращаем Nothing
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки массива
+
+    Dim countCodes                                                                 ' Количество кодов
+    countCodes = UBound(codes) - LBound(codes) + 1                                 ' Считаем длину массива
+
+    If countCodes <= 0 Then                                                       ' Если массив пустой
+        Set WriteCodesValidationList = Nothing                                     ' Возвращаем Nothing
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки длины
+
+    Dim i                                                                         ' Счётчик строк
+    For i = 0 To countCodes - 1                                                   ' Проходим по всем кодам
+        ws.Cells(i + 1, COL_CODES_LIST).Value = codes(LBound(codes) + i)           ' Пишем код в вспомогательную колонку (старт с 1-й строки)
+    Next                                                                           ' Следующий код
+
+    ws.Columns(COL_CODES_LIST).ColumnWidth = 1                                    ' Делаем колонку узкой
+    ws.Columns(COL_CODES_LIST).Hidden = True                                      ' Прячем колонку от пользователя
+
+    Set WriteCodesValidationList = ws.Range(ws.Cells(1, COL_CODES_LIST), ws.Cells(countCodes, COL_CODES_LIST)) ' Возвращаем диапазон, где лежат коды
+
+End Function                                                                      ' Конец WriteCodesValidationList
+
+
+Function LoadCodesFromTsv(path)
+
+    Dim dict                                                                      ' Dictionary для уникальных кодов
+    Set dict = CreateObject("Scripting.Dictionary")                               ' Создаём словарь ключей
+
+    Dim fso                                                                       ' FileSystemObject для проверки файла
+    Set fso = CreateObject("Scripting.FileSystemObject")                          ' Создаём FSO (локально, чтобы не зависеть от глобальной переменной)
+
+    If fso.FileExists(path) = False Then                                          ' Если Code.tsv не найден
+        WScript.Echo "Code.tsv not found: " & path                                  ' Пишем понятное сообщение
+        WScript.Quit 4                                                             ' Останавливаемся с кодом ошибки
+    End If                                                                         ' Конец проверки существования файла
+
+    Dim text                                                                      ' Содержимое Code.tsv
+    text = ReadUtf8File(path)                                                      ' Читаем UTF-8 текст (Code.tsv лежит рядом со скриптами)
+
+    text = Replace(text, vbCrLf, vbLf)                                            ' Нормализуем перевод строки CRLF -> LF
+    text = Replace(text, vbCr, vbLf)                                              ' Нормализуем оставшиеся CR -> LF
+
+    Dim lines                                                                     ' Массив строк файла
+    lines = Split(text, vbLf)                                                      ' Делим по LF
+
+    Dim i                                                                         ' Индекс строки
+    For i = 0 To UBound(lines)                                                    ' Проходим все строки
+
+        Dim ln                                                                    ' Текущая строка
+        ln = Trim(lines(i))                                                        ' Обрезаем пробелы
+
+        If ln <> "" Then                                                          ' Пропускаем пустые строки
+
+            Dim fields                                                            ' Поля строки
+            fields = Split(ln, vbTab)                                              ' Делим по табу
+
+            Dim code                                                              ' Значение кода
+            code = Trim(SafeField(fields, 0))                                      ' Берём 1-е поле и обрезаем пробелы
+
+            If code <> "" Then                                                    ' Если код не пустой
+                If dict.Exists(code) = False Then                                  ' Проверяем уникальность
+                    dict.Add code, True                                            ' Добавляем код в словарь
+                End If                                                             ' Конец проверки уникальности
+            End If                                                                 ' Конец проверки пустоты кода
+
+        End If                                                                    ' Конец проверки пустой строки
+
+    Next                                                                           ' Следующая строка
+
+    If dict.Count = 0 Then                                                        ' Если кодов не нашли
+        LoadCodesFromTsv = Array()                                                 ' Возвращаем пустой массив
+    Else                                                                           ' Если коды есть
+        LoadCodesFromTsv = dict.Keys                                               ' Возвращаем массив ключей (кодов)
+    End If                                                                         ' Конец проверки количества кодов
+
+End Function                                                                      ' Конец LoadCodesFromTsv
+
+
+' ============================================================================= ' Раздел: ЧТЕНИЕ ТЕКСТА (UTF-8 и UTF-16)
 ' =============================================================================
 Function ReadUnicodeFile(path)
 
@@ -348,6 +490,30 @@ Function ReadUnicodeFile(path)
     On Error GoTo 0                                                               ' Возвращаем стандартную обработку ошибок
 
 End Function                                                                      ' Конец ReadUnicodeFile
+
+
+Function ReadUtf8File(path)
+
+    On Error Resume Next                                                          ' Перехват ошибок чтения файла
+
+    Dim stm                                                                       ' ADODB.Stream для чтения UTF-8
+    Set stm = CreateObject("ADODB.Stream")                                        ' Создаём поток
+
+    stm.Type = 2                                                                  ' Тип = текст
+    stm.Charset = "utf-8"                                                         ' Кодировка UTF-8 (для Code.tsv)
+    stm.Open                                                                      ' Открываем поток
+    stm.LoadFromFile path                                                         ' Загружаем файл
+    ReadUtf8File = stm.ReadText(-1)                                               ' Читаем текст целиком
+    stm.Close                                                                     ' Закрываем поток
+
+    If Err.Number <> 0 Then                                                       ' Если чтение упало
+        Err.Clear                                                                 ' Сбрасываем ошибку
+        ReadUtf8File = ""                                                         ' Возвращаем пустую строку
+    End If                                                                        ' Конец обработки ошибок
+
+    On Error GoTo 0                                                               ' Возвращаем стандартную обработку ошибок
+
+End Function                                                                      ' Конец ReadUtf8File
 
 
 ' ============================================================================= ' Раздел: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
