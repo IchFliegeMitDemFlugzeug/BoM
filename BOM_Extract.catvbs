@@ -5,6 +5,7 @@ Dim gRepeatingSubassembliesInTree                                               
 Dim gNonDrawingPartsAsMaterials                                                  ' Флаг: скрывать БЧ-ткань как материалы (из Settings.txt)
 Dim gMassOfStandardParts                                                         ' Флаг: показывать массу стандартных изделий (из Settings.txt)
 Dim gMassOfPKI                                                                   ' Флаг: показывать массу ПКИ (из Settings.txt)
+Dim gCodesDescriptionKeys                                                        ' Массив кодов из Code.tsv, которые ищем в Description
 
 ' -----------------------------                                                    ' Раздел комментария
 ' Точка входа макроса CATIA                                                        ' Описание
@@ -59,6 +60,10 @@ Sub CATMain()                                                                   
         Exit Sub                                                                  ' Если не смогли — выходим
     End If                                                                        ' Конец проверки загрузки настроек
 
+    If LoadCodesFromFile(workFolder) = False Then                                 ' Пробуем загрузить Code.tsv для вычисления codeM (A4)
+        Exit Sub                                                                  ' Если не смогли — выходим
+    End If                                                                        ' Конец проверки загрузки Code.tsv
+
     Dim payloadPath                                                               ' Путь к промежуточному payload
     payloadPath = workFolder & "\BOM_payload.tsv"                                 ' Payload кладём рядом
 
@@ -77,13 +82,19 @@ Sub CATMain()                                                                   
     Dim rootDef                                                                   ' Definition корня
     rootDef = SafeGetDefinition(rootProd)                                         ' Берём Definition (fallback внутри)
 
+    Dim rootDesc                                                                  ' Description корня (для БЧ и кодов по описанию)
+    rootDesc = SafeGetDescription(rootProd)                                       ' Безопасно получаем Description
+
+    Dim rootCodeM                                                                 ' Код для корневой сборки по правилам Code.tsv
+    rootCodeM = DetermineCodeM("ASM", rootDesc)                                  ' Вычисляем codeM с учётом БЧ и Code.tsv
+
     Dim rootLineIndex                                                             ' Индекс строки корня в массиве lines
-    rootLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, "сб", "", "", 0, 0)) ' Пишем корень (масса позже)
+    rootLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, rootCodeM, "", "", 0, 0)) ' Пишем корень (масса позже)
 
     Dim rootMassEach                                                              ' Масса 1 шт корня
     rootMassEach = ProcessNodeCollect(rootProd, rootPN, 0, lines)                 ' Обходим дерево, заполняем lines, получаем массу корня
 
-    lines(rootLineIndex) = MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, "сб", "", "", rootMassEach, rootMassEach) ' Перезаписываем корень с массой
+    lines(rootLineIndex) = MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, rootCodeM, "", "", rootMassEach, rootMassEach) ' Перезаписываем корень с массой
 
     If WriteAllTextUnicode(payloadPath, Join(lines, vbCrLf)) = False Then         ' Если не удалось записать файл
         MsgBox "Не удалось записать файл: " & payloadPath, vbExclamation, "BOM Extract" ' Сообщаем
@@ -236,15 +247,21 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
         Dim thisDef                                                                ' Definition позиции
         thisDef = SafeGetDefinition(childObj)                                      ' Берём Definition
 
+        Dim thisDesc                                                               ' Description позиции (для БЧ и кодов по описанию)
+        thisDesc = SafeGetDescription(childObj)                                    ' Берём Description безопасно
+
         If docType = "ProductDocument" Then                                        ' Если подсборка
 
+            Dim asmCodeM                                                           ' Код подсборки по правилам Code.tsv
+            asmCodeM = DetermineCodeM("ASM", thisDesc)                            ' Вычисляем codeM с учётом Description
+
             Dim asmLineIndex                                                       ' Индекс строки подсборки в payload
-            asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, "сб", "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
+            asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, asmCodeM, "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
 
             Dim asmMassEach                                                        ' Масса 1 шт подсборки
             asmMassEach = ProcessNodeCollect(childObj, thisPN, depth + 1, lines)   ' Рекурсивно обрабатываем подсборку
 
-            lines(asmLineIndex) = MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, "сб", "", "", asmMassEach, asmMassEach * qty) ' Перезаписываем строку с массой
+            lines(asmLineIndex) = MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, asmCodeM, "", "", asmMassEach, asmMassEach * qty) ' Перезаписываем строку с массой
 
             addMass = addMass + (asmMassEach * qty)                                ' Добавляем вклад в массу родителя
 
@@ -280,7 +297,10 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
                 Dim typeN                                                          ' Класс материала для столбца N (Металл/Композит/Неметалл)
                 typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по ключевым словам (см. функцию ниже)
 
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,"дет",typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
+                Dim partCodeM                                                      ' Код детали по правилам Code.tsv
+                partCodeM = DetermineCodeM("PART", thisDesc)                      ' Вычисляем codeM с учётом Description
+
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,partCodeM,typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
 
                 addMass = addMass + (partMassEach * qty)                           ' Добавляем вклад в массу родителя
 
@@ -549,6 +569,24 @@ Function SafeGetDefinition(prodObj)
 End Function                                                                        ' Конец SafeGetDefinition
 
 
+Function SafeGetDescription(prodObj)
+
+    Dim s                                                                           ' Строка результата
+    s = ""                                                                         ' Инициализируем пустой строкой
+
+    On Error Resume Next                                                           ' Перехват ошибок чтения Description
+    s = prodObj.ReferenceProduct.Description                                       ' Пытаемся взять Description у референса
+    If Err.Number <> 0 Or Trim(s) = "" Then                                        ' Если получить не удалось или строка пустая
+        Err.Clear                                                                  ' Чистим ошибку для повторной попытки
+        s = prodObj.Description                                                    ' Пробуем Description у экземпляра
+    End If                                                                         ' Конец проверки первой попытки
+    On Error GoTo 0                                                                ' Снимаем перехват ошибок
+
+    SafeGetDescription = CStr(s)                                                   ' Возвращаем строку Description (может быть пустой)
+
+End Function                                                                        ' Конец SafeGetDescription
+
+
 Function SafeGetPartNumber(prodObj)
 
     Dim s                                                                           ' Строка результата
@@ -619,6 +657,42 @@ Function IsSGTE(partNumber)
     IsSGTE = False                                                                 ' Если дошли сюда — совпадений не было
 
 End Function                                                                        ' Конец IsSGTE
+
+
+Function DetermineCodeM(kindText, descriptionText)
+
+    Dim descNorm                                                                   ' Description в нижнем регистре и без пробелов по краям
+    descNorm = LCase(Trim(CStr(descriptionText)))                                  ' Нормализуем входной Description
+
+    If InStr(descNorm, "бч") > 0 Then                                              ' Самый высокий приоритет: если нашли "бч" в Description
+        DetermineCodeM = "бч"                                                     ' Возвращаем код бч
+        Exit Function                                                              ' Выходим сразу
+    End If                                                                         ' Конец проверки БЧ
+
+    Dim i                                                                          ' Счётчик по кодам, которые ищем в Description
+    For i = 0 To ArrayLastIndex(gCodesDescriptionKeys)                             ' Перебираем все коды из Code.tsv с пометкой description
+
+        Dim keyText                                                                ' Текущий код для поиска
+        keyText = LCase(Trim(CStr(gCodesDescriptionKeys(i))))                      ' Нормализуем код из файла
+
+        If keyText <> "" Then                                                     ' Пустые значения пропускаем
+            If InStr(descNorm, keyText) > 0 Then                                   ' Если код встретился подстрокой в Description
+                DetermineCodeM = gCodesDescriptionKeys(i)                          ' Возвращаем исходный код (в том регистре, как в файле)
+                Exit Function                                                      ' Выходим
+            End If                                                                 ' Конец проверки вхождения
+        End If                                                                     ' Конец проверки пустого кода
+
+    Next                                                                           ' Следующий код из списка
+
+    If kindText = "ASM" Then                                                     ' Дефолт для сборок и подсборок
+        DetermineCodeM = "сб"                                                     ' Код сборки
+    ElseIf kindText = "PART" Then                                                ' Дефолт для деталей
+        DetermineCodeM = "д"                                                      ' Код детали
+    Else                                                                           ' Остальные категории оставляем как есть
+        DetermineCodeM = ""                                                       ' Пустой код (не трогаем существующую логику)
+    End If                                                                         ' Конец выбора по типу
+
+End Function                                                                        ' Конец DetermineCodeM
 
 
 Function IsFastener(partNumber, defText)
@@ -879,6 +953,81 @@ Function LoadSettingsFromFile(workFolder)
     LoadSettingsFromFile = True                                                   ' Сообщаем об успешной загрузке
 
 End Function                                                                       ' Конец LoadSettingsFromFile
+
+
+Function LoadCodesFromFile(workFolder)
+
+    Dim codePath                                                                   ' Полный путь к Code.tsv
+    codePath = workFolder & "\\Code.tsv"                                           ' Файл кодов лежит рядом с выгрузкой
+
+    If FileExists(codePath) = False Then                                           ' Если Code.tsv нет
+        MsgBox "Не найден Code.tsv в папке:" & vbCrLf & workFolder & vbCrLf & _
+               "Положи Code.tsv рядом со скриптами и попробуй снова.", vbExclamation, "BOM Extract" ' Сообщаем о необходимости файла
+        LoadCodesFromFile = False                                                  ' Сообщаем об ошибке загрузки
+        Exit Function                                                              ' Выходим из функции
+    End If                                                                         ' Конец проверки наличия файла
+
+    gCodesDescriptionKeys = Array()                                                ' Сбрасываем список кодов, которые ищем в Description
+
+    Dim readOk                                                                    ' Флаг успешного чтения Code.tsv
+    readOk = False                                                                ' Инициализируем ложью
+
+    Dim codesContent                                                              ' Содержимое Code.tsv
+    codesContent = ReadAllText(codePath, readOk)                                  ' Пробуем прочитать файл целиком
+
+    If readOk = False Then                                                        ' Если прочитать не удалось
+        MsgBox "Не удалось прочитать Code.tsv:" & vbCrLf & codePath, vbExclamation, "BOM Extract" ' Сообщаем пользователю
+        LoadCodesFromFile = False                                                  ' Возвращаем ошибку
+        Exit Function                                                              ' Выходим
+    End If                                                                        ' Конец проверки чтения
+
+    Dim normalizedText                                                            ' Текст с нормализованными переводами строк
+    normalizedText = Replace(codesContent, vbCrLf, vbLf)                          ' Приводим CRLF к LF
+    normalizedText = Replace(normalizedText, vbCr, vbLf)                          ' Убираем одиночные CR
+
+    Dim rows                                                                      ' Массив строк файла
+    rows = Split(normalizedText, vbLf)                                            ' Делим файл по строкам
+
+    Dim i                                                                         ' Счётчик строк
+    For i = 0 To UBound(rows)                                                     ' Перебираем строки Code.tsv
+
+        Dim line                                                                  ' Текущая строка
+        line = Trim(CStr(rows(i)))                                                ' Обрезаем пробелы вокруг
+
+        If line = "" Then                                                        ' Пустые строки пропускаем
+            ' Пропуск                                                             ' Пояснение
+        Else                                                                      ' Есть содержимое строки
+
+            Dim cols                                                              ' Колонки, разделённые табами
+            cols = Split(line, vbTab)                                             ' Разбиваем строку по табуляции
+
+            Dim codeKey                                                           ' Код из первой колонки
+            codeKey = ""                                                         ' Инициализация пустой строкой
+            If UBound(cols) >= 0 Then                                             ' Если есть хотя бы одна колонка
+                codeKey = Trim(CStr(cols(0)))                                     ' Берём первый столбец
+            End If                                                                ' Конец проверки наличия колонок
+
+            Dim hasDescriptionFlag                                               ' Флаг наличия пометки description
+            hasDescriptionFlag = False                                           ' По умолчанию пометки нет
+
+            Dim c                                                                ' Счётчик по колонкам
+            For c = 0 To UBound(cols)                                            ' Перебираем все столбцы
+                If LCase(Trim(CStr(cols(c)))) = "description" Then               ' Если встретили слово description без регистра
+                    hasDescriptionFlag = True                                    ' Отмечаем наличие пометки
+                End If                                                            ' Конец проверки колонки
+            Next                                                                  ' Следующая колонка
+
+            If codeKey <> "" And hasDescriptionFlag = True Then                 ' Если код заполнен и есть пометка description
+                gCodesDescriptionKeys = ArrayAppendValue(gCodesDescriptionKeys, codeKey) ' Добавляем код в список поиска по Description
+            End If                                                                ' Конец добавления кода
+
+        End If                                                                    ' Конец проверки пустой строки
+
+    Next                                                                          ' Переходим к следующей строке
+
+    LoadCodesFromFile = True                                                      ' Сообщаем об успешной загрузке Code.tsv
+
+End Function                                                                       ' Конец LoadCodesFromFile
 
 
 Function ReadAllText(path, ByRef isOk)
