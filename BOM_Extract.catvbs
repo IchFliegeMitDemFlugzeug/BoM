@@ -6,6 +6,8 @@ Dim gNonDrawingPartsAsMaterials                                                 
 Dim gMassOfStandardParts                                                         ' Флаг: показывать массу стандартных изделий (из Settings.txt)
 Dim gMassOfPKI                                                                   ' Флаг: показывать массу ПКИ (из Settings.txt)
 Dim gCodesDescriptionKeys                                                        ' Массив кодов из Code.tsv, которые ищем в Description
+Dim gMetalsKeywords                                                             ' Массив ключей металлов из metals_ru_library.tsv (нижний регистр)
+Dim gCompositeKeywords                                                          ' Массив ключевых слов композитов из composites_detect_keywords.tsv
 
 ' -----------------------------                                                    ' Раздел комментария
 ' Точка входа макроса CATIA                                                        ' Описание
@@ -63,6 +65,10 @@ Sub CATMain()                                                                   
     If LoadCodesFromFile(workFolder) = False Then                                 ' Пробуем загрузить Code.tsv для вычисления codeM (A4)
         Exit Sub                                                                  ' Если не смогли — выходим
     End If                                                                        ' Конец проверки загрузки Code.tsv
+
+    If LoadMaterialLibraries(workFolder) = False Then                             ' Загружаем библиотеки материалов (A6)
+        Exit Sub                                                                  ' Если не смогли — выходим
+    End If                                                                        ' Конец проверки загрузки библиотек материалов
 
     Dim payloadPath                                                               ' Путь к промежуточному payload
     payloadPath = workFolder & "\BOM_payload.tsv"                                 ' Payload кладём рядом
@@ -717,21 +723,15 @@ End Function                                                                    
 
 Function IsFabricOrCarbonByMaterial(materialName)
 
-    Dim s                                                                           ' Нормализованная строка
-    s = LCase(Trim(CStr(materialName)))                                            ' Нижний регистр + Trim
+    Dim normalizedMaterial                                                         ' Материал в нижнем регистре
+    normalizedMaterial = LCase(Trim(CStr(materialName)))                           ' Нормализуем входной текст
 
-    ' Важно: НЕ используем "стекло" как признак.                                   ' Пояснение
-    If InStr(s, "ткан") > 0 Then                                                   ' Любая "ткань"
-        IsFabricOrCarbonByMaterial = True                                          ' Да
-    ElseIf InStr(s, "угле") > 0 Then                                               ' "угле..."
-        IsFabricOrCarbonByMaterial = True                                          ' Да
-    ElseIf InStr(s, "carbon") > 0 Then                                             ' Carbon
-        IsFabricOrCarbonByMaterial = True                                          ' Да
-    ElseIf InStr(s, "cfrp") > 0 Then                                               ' CFRP
-        IsFabricOrCarbonByMaterial = True                                          ' Да
-    Else                                                                           ' Иначе
-        IsFabricOrCarbonByMaterial = False                                         ' Нет
-    End If                                                                         ' Конец ветвления
+    If normalizedMaterial = "" Then                                               ' Если материала нет
+        IsFabricOrCarbonByMaterial = False                                         ' Считаем, что это не ткань
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки пустого текста
+
+    IsFabricOrCarbonByMaterial = MatchesCompositeKeywords(normalizedMaterial, True) ' Ищем признаки ткани/армирования по словарю
 
 End Function                                                                        ' Конец IsFabricOrCarbonByMaterial
 
@@ -742,80 +742,175 @@ End Function                                                                    
 ' -----------------------------                                                    ' Раздел комментария
 Function GuessCompMetalPlusFoam(materialName)
 
-    Dim s                                                                           ' Нормализованная строка материала
-    s = LCase(Trim(CStr(materialName)))                                            ' Приводим к нижнему регистру и убираем пробелы
+    Dim normalizedMaterial                                                         ' Нормализованная строка материала
+    normalizedMaterial = LCase(Trim(CStr(materialName)))                           ' Приводим к нижнему регистру и убираем пробелы
 
-    If s = "" Then                                                                 ' Если материал не задан/не найден
-        GuessCompMetalPlusFoam = ""                                                ' Возвращаем пусто (чтобы было видно, что материал не определён)
+    If normalizedMaterial = "" Then                                               ' Если материал не задан/не найден
+        GuessCompMetalPlusFoam = ""                                               ' Возвращаем пусто (чтобы было видно, что материал не определён)
         Exit Function                                                              ' Выходим
     End If                                                                         ' Конец проверки пустого материала
 
-    ' --------------------                                                          ' Блок 1: Композиты (включая пенопласт)
-    If InStr(s, "пенопласт") > 0 Then                                              ' Явный пенопласт
-        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом (как ты просил)
+    If IsMetalByLibrary(normalizedMaterial) = True Then                            ' Проверяем материал по библиотеке металлов
+        GuessCompMetalPlusFoam = "Металл"                                          ' Возвращаем класс "Металл"
         Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки пенопласта
+    End If                                                                         ' Конец проверки металла
 
-    If InStr(s, "foam") > 0 Or InStr(s, "airex") > 0 Or InStr(s, "roha") > 0 Or InStr(s, "diviny") > 0 Then ' Пены/заполнители в латинице
-        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом
+    If MatchesCompositeKeywords(normalizedMaterial, False) = True Then             ' Проверяем по словарю композитов
+        GuessCompMetalPlusFoam = "Композит"                                        ' Возвращаем класс "Композит"
         Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки пенных заполнителей
+    End If                                                                         ' Конец проверки композита
 
-    If InStr(s, "угл") > 0 Or InStr(s, "угле") > 0 Then                            ' Углеродные материалы (угл/угле)
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки углерода
-
-    If InStr(s, "carbon") > 0 Or InStr(s, "cfrp") > 0 Then                          ' Carbon/CFRP
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки carbon/cfrp
-
-    If InStr(s, "ткан") > 0 Then                                                   ' Любая "ткань" (стекло/уголь/арамид и т.п.)
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки тканевых материалов
-
-    If InStr(s, "стеклопласт") > 0 Or InStr(s, "gfrp") > 0 Then                    ' Стеклопласт/ GFRP
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки стеклопластика
-
-    If InStr(s, "aramid") > 0 Or InStr(s, "кевл") > 0 Or InStr(s, "kevlar") > 0 Then ' Арамид/кевлар
-        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки арамидов
-
-    If InStr(s, "эпокс") > 0 Or InStr(s, "epoxy") > 0 Or InStr(s, "смол") > 0 Or InStr(s, "resin") > 0 Then ' Связующие
-        GuessCompMetalPlusFoam = "Композит"                                        ' В контексте КД это обычно композитная часть
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки связующих
-
-    ' --------------------                                                          ' Блок 2: Металлы
-    If InStr(s, "алю") > 0 Or InStr(s, "д16") > 0 Or InStr(s, "амг") > 0 Or InStr(s, "al ") > 0 Or InStr(s, "al-") > 0 Then ' Алюминиевые сплавы/AL
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки алюминия
-
-    If InStr(s, "сталь") > 0 Or InStr(s, "steel") > 0 Or InStr(s, "12х18") > 0 Or InStr(s, "40х") > 0 Or InStr(s, "aisi") > 0 Then ' Стали/марки
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки стали
-
-    If InStr(s, "титан") > 0 Or InStr(s, "titan") > 0 Or InStr(s, "ti") > 0 Or InStr(s, "вт") > 0 Then ' Титан/ВТ/ Ti
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки титана
-
-    If InStr(s, "магн") > 0 Or InStr(s, "mg") > 0 Then                             ' Магниевые сплавы (очень грубо)
-        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец проверки магния
-
-    ' --------------------                                                          ' Блок 3: Всё остальное (пластики, резины, керамика и т.п.)
-    GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не металл и не композит — считаем неметаллом
+    GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не найдено ни металла, ни композита — считаем неметаллом
 
 End Function                                                                        ' Конец GuessCompMetalPlusFoam
+
+
+Function MatchesCompositeKeywords(normalizedMaterial, onlyFabricGroups)
+
+    Dim i                                                                          ' Счётчик по ключевым словам композитов
+    For i = 0 To ArrayLastIndex(gCompositeKeywords)                                ' Перебираем все записи словаря
+
+        Dim entry                                                                  ' Текущая запись (массив тег/режим/группа)
+        entry = gCompositeKeywords(i)                                              ' Берём запись по индексу
+
+        If IsArray(entry) Then                                                     ' Проверяем, что запись действительно массив
+
+            Dim tagText                                                           ' Ключевой фрагмент
+            tagText = ""                                                         ' Инициализируем пустой строкой
+            If UBound(entry) >= 0 Then                                             ' Проверяем наличие элемента тега
+                tagText = Trim(CStr(entry(0)))                                     ' Берём тег из записи
+            End If                                                                 ' Конец проверки наличия тега
+
+            Dim modeText                                                          ' Режим поиска (contains/regex)
+            modeText = ""                                                        ' Инициализируем пустой строкой
+            If UBound(entry) >= 1 Then                                             ' Проверяем наличие режима
+                modeText = Trim(CStr(entry(1)))                                    ' Берём режим поиска
+            End If                                                                 ' Конец проверки наличия режима
+
+            Dim groupText                                                         ' Название группы (армирование/смолы и т.п.)
+            groupText = ""                                                       ' Инициализируем пустой строкой
+            If UBound(entry) >= 2 Then                                             ' Проверяем наличие группы
+                groupText = Trim(CStr(entry(2)))                                   ' Берём группу из записи
+            End If                                                                 ' Конец проверки наличия группы
+
+            If tagText <> "" And modeText <> "" Then                             ' Убеждаемся, что данные заполнены
+
+                If onlyFabricGroups = False Or IsFabricGroupName(groupText) = True Then ' Фильтруем по группам, если нужно искать только ткани
+
+                    If KeywordMatchesText(tagText, modeText, normalizedMaterial, groupText) = True Then ' Проверяем совпадение по выбранному режиму
+                        MatchesCompositeKeywords = True                             ' Нашли соответствие
+                        Exit Function                                              ' Выходим раньше
+                    End If                                                         ' Конец проверки совпадения
+
+                End If                                                             ' Конец проверки группы для ткани
+
+            End If                                                                 ' Конец проверки заполненности
+
+        End If                                                                    ' Конец проверки записи на массив
+
+    Next                                                                           ' Следующая запись в словаре
+
+    MatchesCompositeKeywords = False                                               ' Если дошли сюда — совпадений нет
+
+End Function                                                                        ' Конец MatchesCompositeKeywords
+
+
+Function IsFabricGroupName(groupName)
+
+    Dim g                                                                          ' Нормализованное имя группы
+    g = LCase(Trim(CStr(groupName)))                                               ' Приводим к нижнему регистру
+
+    If g = "армирование" Then                                                    ' Группа армирования (ткани/волокна)
+        IsFabricGroupName = True                                                   ' Считаем тканью
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки армирования
+
+    If g = "полуфабрикаты/структура" Then                                        ' Препреги/структура переплетения
+        IsFabricGroupName = True                                                   ' Считаем тканью
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки полуфабрикатов
+
+    If g = "размерность/плотность" Then                                          ' Плотность тканей (g/m2 и т.п.)
+        IsFabricGroupName = True                                                   ' Считаем тканью
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки плотности
+
+    If g = "бренды/коммерческие обозначения" Then                                ' Бренды тканей/волокон
+        IsFabricGroupName = True                                                   ' Считаем тканью
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки брендов
+
+    IsFabricGroupName = False                                                      ' Остальные группы не считаем тканями
+
+End Function                                                                        ' Конец IsFabricGroupName
+
+
+Function KeywordMatchesText(tagText, modeText, materialText, groupText)
+
+    Dim mode                                                                       ' Нормализованный режим поиска
+    mode = LCase(Trim(CStr(modeText)))                                             ' Приводим режим к нижнему регистру
+
+    Dim tag                                                                        ' Нормализованный тег
+    tag = LCase(Trim(CStr(tagText)))                                               ' Приводим тег к нижнему регистру
+
+    Dim mat                                                                        ' Материал в нижнем регистре
+    mat = LCase(Trim(CStr(materialText)))                                          ' Нормализуем материал
+
+    If mode = "contains" Then                                                    ' Если нужно искать подстроку
+        KeywordMatchesText = (InStr(mat, tag) > 0)                                 ' Проверяем вхождение тега в материал
+        Exit Function                                                              ' Выходим после проверки contains
+    End If                                                                         ' Конец ветки contains
+
+    If mode = "regex" Then                                                       ' Если нужно искать по регулярному выражению
+
+        Dim needLaritCheck                                                         ' Флаг осторожной проверки Larit 285/287
+        needLaritCheck = (tag = "285" Or tag = "287")                           ' Определяем, относится ли тег к осторожным
+
+        If needLaritCheck = True Then                                              ' Для тегов 285/287 нужна доп. проверка контекста
+            If InStr(mat, "larit") = 0 And InStr(mat, "l285") = 0 And InStr(mat, "l 285") = 0 And _
+               InStr(mat, "l-285") = 0 And InStr(mat, "l287") = 0 And InStr(mat, "l 287") = 0 And _
+               InStr(mat, "l-287") = 0 Then                                      ' Проверяем наличие Larit/L-форм в материале
+                KeywordMatchesText = False                                         ' Без контекста Larit не считаем совпадением
+                Exit Function                                                      ' Выходим раньше
+            End If                                                                 ' Конец проверки контекста Larit
+        End If                                                                     ' Конец ветки осторожной проверки
+
+        Dim re                                                                     ' Объект регулярного выражения
+        Set re = CreateObject("VBScript.RegExp")                                  ' Создаём RegExp
+        re.Pattern = tag                                                           ' Устанавливаем паттерн
+        re.IgnoreCase = True                                                       ' Ищем без регистра
+        re.Global = False                                                          ' Достаточно первого совпадения
+
+        KeywordMatchesText = re.Test(mat)                                          ' Тестируем регулярное выражение
+        Exit Function                                                              ' Выходим после проверки regex
+
+    End If                                                                         ' Конец ветки regex
+
+    KeywordMatchesText = False                                                     ' Если режим неизвестен — считаем, что совпадения нет
+
+End Function                                                                        ' Конец KeywordMatchesText
+
+
+Function IsMetalByLibrary(normalizedMaterial)
+
+    Dim m                                                                          ' Счётчик по ключам металлов
+    For m = 0 To ArrayLastIndex(gMetalsKeywords)                                   ' Перебираем все ключи из библиотеки металлов
+
+        Dim key                                                                   ' Текущий ключ металла
+        key = Trim(CStr(gMetalsKeywords(m)))                                      ' Берём ключ и чистим пробелы
+
+        If key <> "" Then                                                        ' Проверяем, что строка не пустая
+            If InStr(normalizedMaterial, key) > 0 Then                            ' Ищем ключ металла в материале
+                IsMetalByLibrary = True                                           ' Нашли металл
+                Exit Function                                                     ' Выходим
+            End If                                                                ' Конец проверки вхождения
+        End If                                                                    ' Конец проверки пустой строки
+
+    Next                                                                           ' Следующий ключ металла
+
+    IsMetalByLibrary = False                                                      ' Если ничего не нашли — это не металл по библиотеке
+
+End Function                                                                        ' Конец IsMetalByLibrary
 
 
 ' -----------------------------                                                    ' Раздел комментария
@@ -1028,6 +1123,146 @@ Function LoadCodesFromFile(workFolder)
     LoadCodesFromFile = True                                                      ' Сообщаем об успешной загрузке Code.tsv
 
 End Function                                                                       ' Конец LoadCodesFromFile
+
+
+' -----------------------------                                                    ' Раздел комментария
+' Загрузка библиотек материалов из TSV-файлов                                      ' Описание
+' -----------------------------                                                    ' Раздел комментария
+Function LoadMaterialLibraries(workFolder)
+
+    Dim metalsPath                                                                ' Полный путь к metals_ru_library.tsv
+    metalsPath = workFolder & "\metals_ru_library.tsv"                              ' Файл с марками металлов лежит рядом со скриптом
+
+    Dim compositesPath                                                            ' Полный путь к composites_detect_keywords.tsv
+    compositesPath = workFolder & "\composites_detect_keywords.tsv"                ' Файл с ключами композитов лежит рядом со скриптом
+
+    If FileExists(metalsPath) = False Then                                        ' Проверяем наличие файла с металлами
+        MsgBox "Не найден metals_ru_library.tsv в папке:" & vbCrLf & workFolder & vbCrLf & _
+               "Положи metals_ru_library.tsv рядом со скриптами.", vbExclamation, "BOM Extract" ' Сообщаем об отсутствующем файле
+        LoadMaterialLibraries = False                                             ' Сообщаем об ошибке загрузки
+        Exit Function                                                             ' Выходим из функции
+    End If                                                                        ' Конец проверки наличия metals_ru_library.tsv
+
+    If FileExists(compositesPath) = False Then                                    ' Проверяем наличие файла с ключами композитов
+        MsgBox "Не найден composites_detect_keywords.tsv в папке:" & vbCrLf & workFolder & vbCrLf & _
+               "Положи composites_detect_keywords.tsv рядом со скриптами.", vbExclamation, "BOM Extract" ' Сообщаем об отсутствии файла
+        LoadMaterialLibraries = False                                             ' Сообщаем об ошибке загрузки
+        Exit Function                                                             ' Выходим из функции
+    End If                                                                        ' Конец проверки наличия composites_detect_keywords.tsv
+
+    gMetalsKeywords = Array()                                                     ' Очищаем массив ключей металлов перед загрузкой
+    gCompositeKeywords = Array()                                                  ' Очищаем массив ключевых слов композитов
+
+    Dim readOkMetals                                                             ' Флаг успешного чтения файла металлов
+    readOkMetals = False                                                         ' Инициализируем ложью
+
+    Dim metalsContent                                                            ' Содержимое metals_ru_library.tsv
+    metalsContent = ReadAllText(metalsPath, readOkMetals)                        ' Читаем файл с марками металлов
+
+    If readOkMetals = False Then                                                 ' Если прочитать металлы не удалось
+        MsgBox "Не удалось прочитать metals_ru_library.tsv:" & vbCrLf & metalsPath, vbExclamation, "BOM Extract" ' Показываем ошибку
+        LoadMaterialLibraries = False                                             ' Возвращаем ошибку загрузки
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки чтения metals_ru_library.tsv
+
+    Dim normalizedMetalsText                                                     ' Текст металлов с унифицированными переводами строк
+    normalizedMetalsText = Replace(metalsContent, vbCrLf, vbLf)                  ' Заменяем CRLF на LF
+    normalizedMetalsText = Replace(normalizedMetalsText, vbCr, vbLf)             ' Убираем одиночные CR
+
+    Dim metalRows                                                                ' Строки файла металлов
+    metalRows = Split(normalizedMetalsText, vbLf)                                ' Разбиваем файл на строки
+
+    Dim mi                                                                       ' Счётчик строк по металлам
+    For mi = 0 To UBound(metalRows)                                              ' Перебираем все строки таблицы металлов
+
+        Dim metalLine                                                            ' Текущая строка металлов
+        metalLine = Trim(CStr(metalRows(mi)))                                    ' Обрезаем пробелы вокруг
+
+        If metalLine = "" Then                                                  ' Пропускаем пустые строки
+            ' Пропуск                                                             ' Пояснение
+        Else                                                                      ' Есть содержимое строки
+
+            Dim metalCols                                                        ' Колонки строки металлов
+            metalCols = Split(metalLine, vbTab)                                  ' Делим строку по табам
+
+            Dim metalMark                                                        ' Марка/ключ металла из второй колонки
+            metalMark = ""                                                      ' Инициализируем пустой строкой
+            If UBound(metalCols) >= 1 Then                                       ' Проверяем наличие второй колонки
+                metalMark = LCase(Trim(CStr(metalCols(1))))                      ' Берём вторую колонку и нормализуем
+            End If                                                               ' Конец проверки наличия колонки
+
+            If metalMark <> "" And metalMark <> "марка" Then                  ' Игнорируем пустые и заголовок
+                gMetalsKeywords = ArrayAppendValue(gMetalsKeywords, metalMark)   ' Добавляем марку в массив ключей металлов
+            End If                                                               ' Конец проверки валидности строки
+
+        End If                                                                  ' Конец проверки пустой строки
+
+    Next                                                                        ' Следующая строка металлов
+
+    Dim readOkComposite                                                         ' Флаг успешного чтения файла композитов
+    readOkComposite = False                                                     ' Инициализируем ложью
+
+    Dim compositesContent                                                       ' Содержимое composites_detect_keywords.tsv
+    compositesContent = ReadAllText(compositesPath, readOkComposite)            ' Читаем файл с ключами композитов
+
+    If readOkComposite = False Then                                             ' Если прочитать файл не удалось
+        MsgBox "Не удалось прочитать composites_detect_keywords.tsv:" & vbCrLf & compositesPath, vbExclamation, "BOM Extract" ' Показываем ошибку
+        LoadMaterialLibraries = False                                             ' Возвращаем ошибку загрузки
+        Exit Function                                                             ' Выходим
+    End If                                                                        ' Конец проверки чтения composites_detect_keywords.tsv
+
+    Dim normalizedCompositeText                                                 ' Текст композитов с унифицированными переводами строк
+    normalizedCompositeText = Replace(compositesContent, vbCrLf, vbLf)          ' Заменяем CRLF на LF
+    normalizedCompositeText = Replace(normalizedCompositeText, vbCr, vbLf)      ' Убираем одиночные CR
+
+    Dim compositeRows                                                           ' Строки файла композитов
+    compositeRows = Split(normalizedCompositeText, vbLf)                        ' Делим файл на строки
+
+    Dim ci                                                                       ' Счётчик строк по композитам
+    For ci = 0 To UBound(compositeRows)                                          ' Перебираем все строки ключей композитов
+
+        Dim compositeLine                                                       ' Текущая строка ключей
+        compositeLine = Trim(CStr(compositeRows(ci)))                           ' Обрезаем пробелы вокруг
+
+        If compositeLine = "" Then                                             ' Пропускаем пустые строки
+            ' Пропуск                                                             ' Пояснение
+        Else                                                                     ' Есть содержимое строки
+
+            Dim compositeCols                                                   ' Колонки строки композитов
+            compositeCols = Split(compositeLine, vbTab)                         ' Делим строку по табуляции
+
+            Dim groupText                                                       ' Имя группы (например, Армирование)
+            groupText = ""                                                      ' Инициализация
+            If UBound(compositeCols) >= 0 Then                                   ' Если есть первая колонка
+                groupText = LCase(Trim(CStr(compositeCols(0))))                 ' Берём группу и нормализуем
+            End If                                                               ' Конец проверки наличия группы
+
+            Dim tagText                                                         ' Ключевое слово/тег
+            tagText = ""                                                        ' Инициализация
+            If UBound(compositeCols) >= 1 Then                                   ' Если есть вторая колонка
+                tagText = LCase(Trim(CStr(compositeCols(1))))                   ' Берём тег и нормализуем
+            End If                                                               ' Конец проверки наличия тега
+
+            Dim modeText                                                        ' Режим поиска (contains/regex)
+            modeText = ""                                                       ' Инициализация
+            If UBound(compositeCols) >= 2 Then                                   ' Если есть третья колонка
+                modeText = LCase(Trim(CStr(compositeCols(2))))                  ' Берём режим и нормализуем
+            End If                                                               ' Конец проверки наличия режима
+
+            If groupText <> "" And tagText <> "" And modeText <> "" And groupText <> "группа" Then ' Проверяем валидность строки и пропускаем заголовок
+                Dim entry                                                        ' Запись с данными ключевого слова
+                entry = Array(tagText, modeText, groupText)                     ' Укладываем тег/режим/группу в массив
+                gCompositeKeywords = ArrayAppendValue(gCompositeKeywords, entry) ' Добавляем запись в общий массив ключей
+            End If                                                               ' Конец проверки валидности строки композитов
+
+        End If                                                                  ' Конец проверки пустой строки
+
+    Next                                                                        ' Следующая строка композитов
+
+    LoadMaterialLibraries = True                                                 ' Сообщаем об успешной загрузке библиотек
+
+End Function                                                                       ' Конец LoadMaterialLibraries
+
 
 
 Function ReadAllText(path, ByRef isOk)
