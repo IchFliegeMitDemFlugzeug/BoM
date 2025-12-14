@@ -50,7 +50,7 @@ Sub CATMain()                                                                   
     Dim workFolder                                                                ' Папка, где лежат файлы
     workFolder = GetFolderFromFullPath(outXlsx)                                   ' Папка = папка выбранного Excel
 
-    gProjectCodes = DefaultProjectCodes()                                         ' Заполняем список кодов проекта значениями по умолчанию
+    gProjectCodes = DefaultProjectCodes()                                         ' Готовим список кодов проекта (пустой, ждём Settings)
     gRepeatingSubassemblies = False                                               ' Ставим дефолт для флага раскрутки подсборок
 
     gNonDrawingPartsAsMaterials = False                                           ' По умолчанию БЧ-детали не переводим в материалы
@@ -58,6 +58,11 @@ Sub CATMain()                                                                   
     gMassOfPKI = False                                                            ' По умолчанию не выводим массы ПКИ
 
     Call LoadSettings(workFolder & "\Settings.txt", gProjectCodes, gRepeatingSubassemblies, gNonDrawingPartsAsMaterials, gMassOfStandardParts, gMassOfPKI) ' Пытаемся прочитать настройки пользователя
+
+    If ArrayLastIndex(gProjectCodes) < 0 Then                                    ' Если в настройках не нашлось кодов проекта
+        MsgBox "В Settings.txt не задан Project_code. Добавь список кодов через запятую и запусти макрос заново.", vbExclamation, "BOM Extract" ' Подсказываем, что нужно заполнить Project_code
+        Exit Sub                                                                  ' Без кодов проекта продолжать нельзя
+    End If                                                                        ' Конец проверки наличия кодов проекта
     gCodeRules = LoadCodeRules(workFolder & "\Code.tsv")                        ' Загружаем правила для столбца "код"
     Call LoadMaterialLibraries(workFolder)                                        ' Готовим списки металлов/композитов
 
@@ -86,55 +91,7 @@ Sub CATMain()                                                                   
     rootPN = SafeGetPartNumber(rootProd)                                          ' Берём PartNumber корневой сборки
 
     Dim rootDef                                                                   ' Definition корня
-    rootDef = SafeGetDefinition(rootProd)                                         ' Берём Definition (fallback внутри)
-
-    Dim rootLineIndex                                                             ' Индекс строки корня в массиве lines
-    rootLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, "сб", "", "", 0, 0)) ' Пишем корень (масса позже)
-
-    Dim rootMassEach                                                              ' Масса 1 шт корня
-    rootMassEach = ProcessNodeCollect(rootProd, rootPN, 0, lines)                 ' Обходим дерево, заполняем lines, получаем массу корня
-
-    lines(rootLineIndex) = MakeTSVLine(0, "ASM", rootPN, rootPN, rootDef, "", 1, "сб", "", "", rootMassEach, rootMassEach) ' Перезаписываем корень с массой
-
-    If WriteAllTextUnicode(payloadPath, Join(lines, vbCrLf)) = False Then         ' Если не удалось записать файл
-        MsgBox "Не удалось записать файл: " & payloadPath, vbExclamation, "BOM Extract" ' Сообщаем
-        Exit Sub                                                                  ' Выходим
-    End If                                                                        ' Конец проверки записи
-
-    Dim cmd                                                                       ' Команда запуска ExcelBuilder
-    cmd = "wscript.exe " & Quote(builderPath) & " " & Quote(payloadPath) & " " & Quote(outXlsx) & " " & CStr(startLevel) ' Передаём payload, xlsx и старт-уровень
-
-    Dim sh                                                                        ' WScript.Shell для запуска
-    Set sh = CreateObject("WScript.Shell")                                        ' Создаём shell
-    sh.Run cmd, 1, True                                                           ' Запускаем и ждём завершения
-
-    MsgBox "Готово." & vbCrLf & "Excel: " & outXlsx, vbInformation, "BOM Extract" ' Финальное сообщение
-
-End Sub                                                                           ' Конец CATMain
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Рекурсивная обработка узла (сборка)                                              ' Описание
-' Возвращает массу 1 шт данного узла                                               ' Описание
-' -----------------------------                                                    ' Раздел комментария
-Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)             ' Рекурсивный обход
-
-    Dim sumMassEach                                                               ' Масса 1 шт родителя = сумма масс детей
-    sumMassEach = 0                                                               ' Начинаем с 0
-
-    Dim dictQty                                                                   ' Словарь количества по позиции
-    Set dictQty = CreateObject("Scripting.Dictionary")                            ' key -> qty
-
-    Dim dictFirst                                                                 ' Словарь “первого объекта” для позиции
-    Set dictFirst = CreateObject("Scripting.Dictionary")                          ' key -> child object
-
-    Dim dictDocType                                                               ' Словарь типа документа для позиции
-    Set dictDocType = CreateObject("Scripting.Dictionary")                        ' key -> "ProductDocument"/"PartDocument"/"Unknown"
-
-    Dim ordASM, ordSGTE, ordFAST, ordPKI                                          ' Массивы порядка по группам
-    ordASM = Array()                                                              ' Подсборки
-    ordSGTE = Array()                                                             ' Детали SGTE/СГТЕ
-    ordFAST = Array()                                                             ' Крепёж (DIN/ОСТ)
+@@ -117,50 +143,53 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)
     ordPKI = Array()                                                              ' ПКИ (прочие)
 
     Dim i                                                                         ' Счётчик детей
@@ -188,37 +145,7 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
 
                     Dim flagSgte                                                   ' Флаг “SGTE/СГТЕ” (имя НЕ конфликтует с функцией IsSGTE)
                     flagSgte = IsSGTE(childPN)                                     ' Вызываем функцию IsSGTE и получаем True/False
-
-                    If flagSgte = True Then                                        ' Если это деталь SGTE/СГТЕ
-                        ordSGTE = ArrayAppendValue(ordSGTE, key)                   ' Добавляем позицию в список “SGTE”
-                    Else                                                           ' Иначе — это ПКИ
-                        ordPKI = ArrayAppendValue(ordPKI, key)                     ' Добавляем позицию в список “ПКИ”
-                    End If                                                         ' Конец ветвления SGTE/PKI
-
-                End If                                                             ' Конец ветвления Fastener/обычный
-
-            Else                                                                   ' Неизвестный тип документа
-                ordPKI = ArrayAppendValue(ordPKI, key)                             ' Считаем как ПКИ (чтобы не потерять)
-            End If                                                                 ' Конец классификации
-
-        End If                                                                     ' Конец Exists
-    Next                                                                           ' Следующий ребёнок
-
-    ' ---- Вывод в нужном порядке: 1) подсборки 2) SGTE 3) крепёж 4) ПКИ ----      ' Пояснение
-    sumMassEach = sumMassEach + EmitGroup(ordASM, "ASM", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' Подсборки
-    sumMassEach = sumMassEach + EmitGroup(ordSGTE, "SGTE", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Детали SGTE
-    sumMassEach = sumMassEach + EmitGroup(ordFAST, "FAST", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Крепёж
-    sumMassEach = sumMassEach + EmitGroup(ordPKI, "PKI", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' ПКИ
-
-    ProcessNodeCollect = sumMassEach                                               ' Возвращаем массу 1 шт узла
-
-End Function                                                                       ' Конец ProcessNodeCollect
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Вывод одной группы (ASM/SGTE/FAST/PKI)                                           ' Описание
-' Возвращает вклад массы в родительскую сборку (учитывая qty)                      ' Описание
-' -----------------------------                                                    ' Раздел комментария
+@@ -198,96 +227,150 @@ End Function
 Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, ByRef lines)
 
     Dim addMass                                                                    ' Суммарная масса, которую добавит эта группа
@@ -250,6 +177,7 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
         If docType = "ProductDocument" Then                                        ' Если подсборка
 
             Dim asmLineIndex                                                       ' Индекс строки подсборки в payload
+            asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, "сб", "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
             asmLineIndex = AppendLineReturnIndex(lines, MakeTSVLine(depth + 1, "ASM", thisPN, thisPN, thisDef, parentPN, qty, DetectCode("ASM", thisDesc), "", "", 0, 0)) ' Добавляем строку подсборки (массу пересчитаем)
 
             Dim asmMassEach                                                        ' Масса 1 шт подсборки
@@ -265,21 +193,22 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 ' ВАЖНО: для крепежа НЕ заполняем N, O, P, Q в Excel.               ' Пояснение
                 ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "крепеж". ' Пояснение
-                Dim fastMassEach
-                Dim fastMassTotal
-                fastMassEach = Empty
-                fastMassTotal = Empty
-                If gMassOfStandardParts = True Then
-                    Dim fastPartDoc
-                    On Error Resume Next
-                    Set fastPartDoc = childObj.ReferenceProduct.Parent
-                    If Err.Number = 0 Then
-                        Dim tmpMat
-                        Call MeasurePartMaterialAndMass(fastPartDoc, tmpMat, fastMassEach)
-                        fastMassTotal = CDbl(fastMassEach) * qty
-                    End If
-                    On Error GoTo 0
-                End If
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, "крепеж", "", "", Empty, Empty)
+                Dim fastMassEach                                                     ' Масса 1 шт крепежа (может остаться пустой)
+                Dim fastMassTotal                                                    ' Масса всего крепежа в позиции (qty * mass)
+                fastMassEach = Empty                                                 ' По умолчанию оставляем пустым, если вывод массы выключен
+                fastMassTotal = Empty                                                ' Итоговая масса тоже пустая по умолчанию
+                If gMassOfStandardParts = True Then                                 ' Считаем массу крепежа только если флаг разрешён
+                    Dim fastPartDoc                                                  ' Документ детали крепежа
+                    On Error Resume Next                                             ' Перехватываем ошибку, если документ не загружен
+                    Set fastPartDoc = childObj.ReferenceProduct.Parent              ' Пытаемся получить PartDocument крепежа
+                    If Err.Number = 0 Then                                          ' Если документ получили без ошибок
+                        Dim tmpMat                                                   ' Временная переменная для материала (не используется далее)
+                        Call MeasurePartMaterialAndMass(fastPartDoc, tmpMat, fastMassEach) ' Снимаем массу одной штуки через замер геометрии
+                        fastMassTotal = CDbl(fastMassEach) * qty                    ' Умножаем массу одной штуки на количество в позиции
+                    End If                                                           ' Конец проверки ошибки
+                    On Error GoTo 0                                                  ' Возвращаем обычную обработку ошибок
+                End If                                                               ' Конец блока расчёта массы крепежа
 
                 AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, DetectCode("FAST", thisDesc), "", "", fastMassEach, fastMassTotal)
                 If Not IsEmpty(fastMassTotal) Then
@@ -293,21 +222,22 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 ' ВАЖНО: для ПКИ НЕ заполняем N, O, P, Q в Excel.                   ' Пояснение
                 ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "ПКИ". ' Пояснение
-                Dim pkiMassEach
-                Dim pkiMassTotal
-                pkiMassEach = Empty
-                pkiMassTotal = Empty
-                If gMassOfPKI = True Then
-                    Dim pkiPartDoc
-                    On Error Resume Next
-                    Set pkiPartDoc = childObj.ReferenceProduct.Parent
-                    If Err.Number = 0 Then
-                        Dim tmpMatPki
-                        Call MeasurePartMaterialAndMass(pkiPartDoc, tmpMatPki, pkiMassEach)
-                        pkiMassTotal = CDbl(pkiMassEach) * qty
-                    End If
-                    On Error GoTo 0
-                End If
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, "ПКИ", "", "", Empty, Empty)
+                Dim pkiMassEach                                                      ' Масса 1 шт ПКИ (может быть пустой при выключенном флаге)
+                Dim pkiMassTotal                                                     ' Масса всей позиции ПКИ (qty * mass)
+                pkiMassEach = Empty                                                  ' По умолчанию не выводим массу
+                pkiMassTotal = Empty                                                 ' Итоговая масса тоже пустая
+                If gMassOfPKI = True Then                                            ' Считаем массу только если разрешено настройкой
+                    Dim pkiPartDoc                                                   ' Документ ПКИ
+                    On Error Resume Next                                             ' Перехватываем возможные ошибки доступа
+                    Set pkiPartDoc = childObj.ReferenceProduct.Parent               ' Пробуем получить PartDocument ПКИ
+                    If Err.Number = 0 Then                                          ' Если документ доступен
+                        Dim tmpMatPki                                                ' Временная переменная материала для совместимости с процедурой измерения
+                        Call MeasurePartMaterialAndMass(pkiPartDoc, tmpMatPki, pkiMassEach) ' Замеряем массу одной штуки ПКИ
+                        pkiMassTotal = CDbl(pkiMassEach) * qty                      ' Считаем массу всей позиции с учётом количества
+                    End If                                                           ' Конец проверки ошибки
+                    On Error GoTo 0                                                  ' Возвращаем стандартную обработку ошибок
+                End If                                                               ' Конец блока расчёта массы ПКИ
 
                 AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, DetectCode("PKI", thisDesc), "", "", pkiMassEach, pkiMassTotal)
                 If Not IsEmpty(pkiMassTotal) Then
@@ -327,6 +257,7 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
                 Call MeasurePartMaterialAndMass(partDoc, partMat, partMassEach)    ' Измеряем материал и массу
 
                 Dim typeN                                                          ' Класс материала для столбца N (Металл/Композит/Неметалл)
+                typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по ключевым словам (см. функцию ниже)
                 typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по библиотекам
 
                 Dim codeValue                                                      ' Код для столбца M
@@ -343,6 +274,7 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                     AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,codeValue,typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
 
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1,"PART",thisPN,thisPN,thisDef,parentPN,qty,"дет",typeN,partMat,partMassEach,partMassEach * qty)                                            ' MassTotalKg (столбец Q)
                 End If
 
                 addMass = addMass + (partMassEach * qty)                           ' Добавляем вклад в массу родителя
@@ -369,224 +301,7 @@ Sub MeasurePartMaterialAndMass(partDoc, ByRef partMat, ByRef partMassEach)      
 
     Dim oPart                                                                      ' Объект Part
     Set oPart = partDoc.Part                                                       ' Берём Part
-
-    On Error Resume Next                                                           ' Перехват на случай проблем обновления
-    oPart.Update                                                                   ' Обновляем модель
-    On Error GoTo 0                                                                ' Снимаем перехват
-
-    partMassEach = 0                                                               ' Масса детали = 0 по умолчанию
-    partMat = ""                                                                   ' Материал детали пустой по умолчанию
-
-    Dim bestMat                                                                    ' Первый найденный материал (если не сможем точно)
-    bestMat = ""                                                                   ' Инициализация
-
-    Dim b                                                                          ' Счётчик Body
-    For b = 1 To oPart.Bodies.Count                                                ' Перебираем все Body
-
-        Dim oBody                                                                  ' Текущий Body
-        Set oBody = oPart.Bodies.Item(b)                                           ' Берём Body
-
-        Dim meas                                                                   ' Результат измерения
-        meas = MeasureBodyMass(oPart, partDoc, oBody)                              ' Пробуем измерить массу твёрдого Body
-
-        If IsEmpty(meas) Then                                                      ' Если не твёрдое тело
-            ' Пропускаем                                                          ' Пояснение
-        Else
-            partMassEach = partMassEach + CDbl(meas)                               ' Суммируем массу по твёрдым телам
-
-            Dim mi                                                                 ' Материал как Array(name, density, source)
-            mi = ResolveMaterialAllWays(partDoc, oPart, oBody)                     ' Ищем материал на Body/Part/и т.д.
-
-            If Trim(CStr(mi(0))) <> "" Then                                        ' Если имя материала найдено
-                If bestMat = "" Then                                               ' Если ещё не запоминали материал
-                    bestMat = CStr(mi(0))                                          ' Запоминаем первый найденный
-                End If                                                             ' Конец bestMat пустой?
-            End If                                                                 ' Конец "материал найден?"
-        End If                                                                     ' Конец "твёрдое тело?"
-
-    Next                                                                           ' Следующий Body
-
-    ' Итоговый материал детали:                                                    ' Пояснение
-    ' 1) если на уровне Part/продукта есть материал — берём его, иначе первый найденный по Body
-    Dim miPart                                                                     ' Материал на уровне Part/Product
-    miPart = ResolveMaterialAllWays(partDoc, oPart, Nothing)                       ' Ищем материал без Body
-
-    If Trim(CStr(miPart(0))) <> "" Then                                            ' Если нашли на уровне Part/Product
-        partMat = CStr(miPart(0))                                                  ' Берём его
-    Else                                                                           ' Если на уровне Part/Product нет
-        partMat = bestMat                                                          ' Используем первый найденный по Body
-    End If                                                                         ' Конец выбора итогового материала
-
-End Sub                                                                            ' Конец MeasurePartMaterialAndMass
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Измерение массы Body (если твёрдое тело)                                         ' Описание
-' Возвращает массу (кг) или Empty                                                  ' Описание
-' -----------------------------                                                    ' Раздел комментария
-Function MeasureBodyMass(oPart, partDoc, oBody)
-
-    Dim spa                                                                         ' SPAWorkbench
-    Set spa = partDoc.GetWorkbench("SPAWorkbench")                                 ' Получаем верстак измерений
-
-    Dim inertia                                                                     ' Inertia объект
-    Set inertia = Nothing                                                           ' Инициализация
-
-    On Error Resume Next                                                            ' Перехват
-    Set inertia = spa.Inertias.Add(oBody)                                           ' Создаём инерцию по Body
-    On Error GoTo 0                                                                 ' Снимаем перехват
-
-    If inertia Is Nothing Then                                                      ' Если инерцию создать не удалось
-        MeasureBodyMass = Empty                                                     ' Считаем, что измерение невозможно
-        Exit Function                                                               ' Выходим
-    End If                                                                          ' Конец проверки inertia
-
-    Dim m                                                                           ' Масса
-    m = 0                                                                           ' По умолчанию 0
-    On Error Resume Next                                                            ' Перехват
-    m = inertia.Mass                                                                ' Берём массу (кг)
-    On Error GoTo 0                                                                 ' Снимаем
-
-    ' Фильтр “твёрдого тела”: если масса <= 0 — считаем, что это не solid           ' Пояснение
-    If CDbl(m) <= 0 Then                                                            ' Если масса не определилась
-        MeasureBodyMass = Empty                                                     ' Возвращаем Empty
-        Exit Function                                                               ' Выходим
-    End If                                                                          ' Конец фильтра массы
-
-    MeasureBodyMass = CDbl(m)                                                       ' Возвращаем массу
-
-End Function                                                                        ' Конец MeasureBodyMass
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Материал: ищем максимально широко                                                 ' Описание
-' -----------------------------                                                    ' Раздел комментария
-Function ResolveMaterialAllWays(partDoc, oPart, oBody)
-
-    Dim mgr                                                                         ' Менеджер материалов
-    Set mgr = GetMaterialManager(partDoc)                                           ' Получаем CATMatManagerVBExt
-
-    Dim mat                                                                         ' Объект материала
-    Set mat = Nothing                                                               ' Инициализация
-
-    ' 1) Material на Body                                                           ' Пояснение
-    If Not (oBody Is Nothing) Then                                                  ' Если Body передан
-        If Not (mgr Is Nothing) Then                                                ' Если менеджер доступен
-            On Error Resume Next                                                    ' Перехват
-            mgr.GetMaterialOnBody oBody, mat                                        ' Пытаемся получить материал
-            On Error GoTo 0                                                         ' Снимаем
-            If Not (mat Is Nothing) Then                                            ' Если нашли
-                ResolveMaterialAllWays = Array(mat.Name, 0, "Body")                 ' Возвращаем имя
-                Exit Function                                                       ' Выходим
-            End If                                                                  ' Конец проверки mat
-        End If                                                                      ' Конец проверки mgr
-    End If                                                                          ' Конец проверки oBody
-
-    ' 2) Material на MainBody                                                       ' Пояснение
-    If Not (mgr Is Nothing) Then                                                    ' Если менеджер доступен
-        Dim mainB                                                                   ' MainBody
-        Set mainB = Nothing                                                         ' Инициализация
-        On Error Resume Next                                                         ' Перехват
-        Set mainB = oPart.MainBody                                                  ' Берём главный Body
-        On Error GoTo 0                                                              ' Снимаем перехват
-        If Not (mainB Is Nothing) Then                                              ' Если MainBody есть
-            Set mat = Nothing                                                       ' Обнуляем mat
-            On Error Resume Next                                                    ' Перехват
-            mgr.GetMaterialOnBody mainB, mat                                        ' Пытаемся получить материал
-            On Error GoTo 0                                                         ' Снимаем
-            If Not (mat Is Nothing) Then                                            ' Если нашли
-                ResolveMaterialAllWays = Array(mat.Name, 0, "MainBody")             ' Возвращаем имя
-                Exit Function                                                       ' Выходим
-            End If                                                                  ' Конец проверки mat
-        End If                                                                      ' Конец проверки mainB
-    End If                                                                          ' Конец проверки mgr
-
-    ' 3) Material на Part (если метод есть)                                         ' Пояснение
-    If Not (mgr Is Nothing) Then                                                    ' Если менеджер доступен
-        Set mat = Nothing                                                           ' Обнуляем mat
-        On Error Resume Next                                                        ' Перехват
-        mgr.GetMaterialOnPart oPart, mat                                            ' Пытаемся получить материал
-        On Error GoTo 0                                                             ' Снимаем
-        If Not (mat Is Nothing) Then                                                ' Если нашли
-            ResolveMaterialAllWays = Array(mat.Name, 0, "Part")                     ' Возвращаем имя
-            Exit Function                                                           ' Выходим
-        End If                                                                      ' Конец проверки mat
-    End If                                                                          ' Конец проверки mgr
-
-    ' 4) Material на Product внутри CATPart                                         ' Пояснение
-    If Not (mgr Is Nothing) Then                                                    ' Если менеджер доступен
-        Set mat = Nothing                                                           ' Обнуляем mat
-        On Error Resume Next                                                        ' Перехват
-        mgr.GetMaterialOnProduct partDoc.Product, mat                               ' Пытаемся получить материал
-        On Error GoTo 0                                                             ' Снимаем
-        If Not (mat Is Nothing) Then                                                ' Если нашли
-            ResolveMaterialAllWays = Array(mat.Name, 0, "Product")                  ' Возвращаем имя
-            Exit Function                                                           ' Выходим
-        End If                                                                      ' Конец проверки mat
-    End If                                                                          ' Конец проверки mgr
-
-    ' 5) Параметр Material/Материал                                                 ' Пояснение
-    Dim pm                                                                          ' Переменная для параметра
-    Set pm = TryFindMaterialParameter(partDoc)                                      ' Пытаемся найти параметр материала
-    If Not (pm Is Nothing) Then                                                     ' Если параметр найден
-        Dim valStr                                                                  ' Строковое значение параметра
-        valStr = ""                                                                ' Инициализация
-        On Error Resume Next                                                        ' Перехват
-        valStr = pm.ValueAsString                                                   ' Читаем как строку
-        On Error GoTo 0                                                             ' Снимаем перехват
-        ResolveMaterialAllWays = Array(valStr, 0, "Parameter")                      ' Возвращаем значение
-        Exit Function                                                               ' Выходим
-    End If                                                                          ' Конец проверки параметра
-
-    ResolveMaterialAllWays = Array("", 0, "NotFound")                               ' Если нигде не нашли — возвращаем пусто
-
-End Function                                                                        ' Конец ResolveMaterialAllWays
-
-
-Function GetMaterialManager(partDoc)
-
-    Dim mgr                                                                         ' Переменная для менеджера материалов
-    Set mgr = Nothing                                                               ' Инициализация
-
-    On Error Resume Next                                                            ' Перехват ошибок
-    Set mgr = partDoc.Part.GetItem("CATMatManagerVBExt")                            ' Пытаемся получить менеджер из Part
-    If Err.Number <> 0 Or mgr Is Nothing Then                                       ' Если не получилось
-        Err.Clear                                                                  ' Сбрасываем ошибку
-        Set mgr = partDoc.Product.GetItem("CATMatManagerVBExt")                     ' Пытаемся получить менеджер из Product
-    End If                                                                          ' Конец фолбэка
-    On Error GoTo 0                                                                 ' Снимаем перехват
-
-    Set GetMaterialManager = mgr                                                    ' Возвращаем менеджер (или Nothing)
-
-End Function                                                                        ' Конец GetMaterialManager
-
-
-Function TryFindMaterialParameter(partDoc)
-
-    Dim params                                                                      ' Коллекция параметров Part
-    Set params = partDoc.Part.Parameters                                            ' Берём параметры
-
-    Dim names                                                                       ' Массив возможных имён параметра материала
-    names = Array("Material", "MATERIAL", "Материал", "МАТЕРИАЛ", "Mat", "MAT")     ' Перечень вариантов имён
-
-    Dim i                                                                           ' Счётчик
-    For i = 0 To UBound(names)                                                      ' Перебираем варианты имён
-        Dim p                                                                       ' Параметр
-        Set p = Nothing                                                             ' Инициализация
-        On Error Resume Next                                                        ' Перехват
-        Set p = params.Item(names(i))                                               ' Пытаемся получить параметр по имени
-        On Error GoTo 0                                                             ' Снимаем перехват
-        If Not (p Is Nothing) Then                                                  ' Если нашли
-            Set TryFindMaterialParameter = p                                        ' Возвращаем найденный параметр
-            Exit Function                                                           ' Выходим
-        End If                                                                      ' Конец проверки p
-    Next                                                                            ' Следующий вариант имени
-
-    Set TryFindMaterialParameter = Nothing                                          ' Если не нашли — возвращаем Nothing
-
-End Function                                                                        ' Конец TryFindMaterialParameter
-
-
+@@ -512,101 +595,165 @@ End Function
 ' -----------------------------                                                    ' Раздел комментария
 ' Definition: берём Definition, иначе Nomenclature/Name                             ' Описание
 ' -----------------------------                                                    ' Раздел комментария
@@ -705,13 +420,34 @@ Function IsSGTE(partNumber)
 
     Dim s                                                                           ' Нормализованная строка
     s = UCase(Trim(CStr(partNumber)))                                              ' Приводим к верхнему регистру и обрезаем
+    Dim s                                                                           ' Нормализованная строка номера
+    s = UCase(Trim(CStr(partNumber)))                                              ' Приводим к верхнему регистру и обрезаем пробелы
+
+    If Left(s, 4) = "SGTE" Then                                                    ' Латинский префикс
+        IsSGTE = True                                                              ' Да
+    ElseIf Left(s, 4) = "СГТЕ" Then                                                ' Кириллический префикс
+        IsSGTE = True                                                              ' Да
+    Else                                                                           ' Иначе
+        IsSGTE = False                                                             ' Нет
+    End If                                                                         ' Конец ветвления
+    If ArrayLastIndex(gProjectCodes) < 0 Then                                      ' Если список кодов проекта пустой
+        IsSGTE = False                                                             ' Считаем, что совпадений нет
+        Exit Function                                                              ' Выходим, чтобы не падать на пустом массиве
+    End If                                                                         ' Конец проверки пустого списка
 
     Dim idx                                                                         ' Индекс по массиву кодов
     For idx = LBound(gProjectCodes) To UBound(gProjectCodes)                       ' Перебираем все коды проекта
-        If Left(s, Len(CStr(gProjectCodes(idx)))) = UCase(CStr(gProjectCodes(idx))) Then ' Сравниваем префикс с кодом
-            IsSGTE = True                                                          ' Нашли совпадение
-            Exit Function                                                          ' Выходим сразу
-        End If                                                                     ' Конец проверки префикса
+
+        Dim code                                                                   ' Текущий код из настроек
+        code = UCase(CStr(gProjectCodes(idx)))                                     ' Нормализуем код для поиска без учёта регистра
+
+        If Len(code) > 0 Then                                                      ' Пропускаем пустые строки настроек
+            If InStr(1, s, code, vbTextCompare) > 0 Then                           ' Ищем вхождение кода в любой части номера
+                IsSGTE = True                                                      ' Нашли совпадение
+                Exit Function                                                      ' Выходим сразу после первой удачи
+            End If                                                                 ' Конец проверки вхождения
+        End If                                                                     ' Конец проверки пустого кода
+
     Next                                                                           ' Следующий код проекта
 
     IsSGTE = False                                                                 ' Если не нашли ни одного совпадения — False
@@ -740,15 +476,7 @@ End Function                                                                    
 
 
 Function IsFabricOrCarbonByMaterial(materialName)
-
-    Dim s                                                                           ' Нормализованная строка
-    s = LCase(Trim(CStr(materialName)))                                            ' Нижний регистр + Trim
-
-    ' Важно: НЕ используем "стекло" как признак.                                   ' Пояснение
-    If InStr(s, "ткан") > 0 Then                                                   ' Любая "ткань"
-        IsFabricOrCarbonByMaterial = True                                          ' Да
-    ElseIf InStr(s, "угле") > 0 Then                                               ' "угле..."
-        IsFabricOrCarbonByMaterial = True                                          ' Да
+@@ -622,116 +769,247 @@ Function IsFabricOrCarbonByMaterial(materialName)
     ElseIf InStr(s, "carbon") > 0 Then                                             ' Carbon
         IsFabricOrCarbonByMaterial = True                                          ' Да
     ElseIf InStr(s, "cfrp") > 0 Then                                               ' CFRP
@@ -774,21 +502,82 @@ Function GuessCompMetalPlusFoam(materialName)
         Exit Function                                                              ' Выходим
     End If                                                                         ' Конец проверки пустого материала
 
+    ' --------------------                                                          ' Блок 1: Композиты (включая пенопласт)
+    If InStr(s, "пенопласт") > 0 Then                                              ' Явный пенопласт
+        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом (как ты просил)
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки пенопласта
+
+    If InStr(s, "foam") > 0 Or InStr(s, "airex") > 0 Or InStr(s, "roha") > 0 Or InStr(s, "diviny") > 0 Then ' Пены/заполнители в латинице
+        GuessCompMetalPlusFoam = "Композит"                                        ' Считаем композитом
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки пенных заполнителей
+
+    If InStr(s, "угл") > 0 Or InStr(s, "угле") > 0 Then                            ' Углеродные материалы (угл/угле)
+        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки углерода
     If IsCompositeByKeywords(s) Then                                               ' Проверяем словарь композитов
         GuessCompMetalPlusFoam = "Композит"                                        ' Возвращаем "Композит"
         Exit Function
     End If
 
+    If InStr(s, "carbon") > 0 Or InStr(s, "cfrp") > 0 Then                          ' Carbon/CFRP
+        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки carbon/cfrp
     If IsMetalByKeywords(s) Then                                                   ' Проверяем словарь металлов
         GuessCompMetalPlusFoam = "Металл"                                          ' Возвращаем "Металл"
         Exit Function
     End If
 
+    If InStr(s, "ткан") > 0 Then                                                   ' Любая "ткань" (стекло/уголь/арамид и т.п.)
+        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки тканевых материалов
+
+    If InStr(s, "стеклопласт") > 0 Or InStr(s, "gfrp") > 0 Then                    ' Стеклопласт/ GFRP
+        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки стеклопластика
     GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не попали в словари — считаем неметаллом
 
+    If InStr(s, "aramid") > 0 Or InStr(s, "кевл") > 0 Or InStr(s, "kevlar") > 0 Then ' Арамид/кевлар
+        GuessCompMetalPlusFoam = "Композит"                                        ' Композит
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки арамидов
+
+    If InStr(s, "эпокс") > 0 Or InStr(s, "epoxy") > 0 Or InStr(s, "смол") > 0 Or InStr(s, "resin") > 0 Then ' Связующие
+        GuessCompMetalPlusFoam = "Композит"                                        ' В контексте КД это обычно композитная часть
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки связующих
+
+    ' --------------------                                                          ' Блок 2: Металлы
+    If InStr(s, "алю") > 0 Or InStr(s, "д16") > 0 Or InStr(s, "амг") > 0 Or InStr(s, "al ") > 0 Or InStr(s, "al-") > 0 Then ' Алюминиевые сплавы/AL
+        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки алюминия
+
+    If InStr(s, "сталь") > 0 Or InStr(s, "steel") > 0 Or InStr(s, "12х18") > 0 Or InStr(s, "40х") > 0 Or InStr(s, "aisi") > 0 Then ' Стали/марки
+        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки стали
+
+    If InStr(s, "титан") > 0 Or InStr(s, "titan") > 0 Or InStr(s, "ti") > 0 Or InStr(s, "вт") > 0 Then ' Титан/ВТ/ Ti
+        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки титана
+
+    If InStr(s, "магн") > 0 Or InStr(s, "mg") > 0 Then                             ' Магниевые сплавы (очень грубо)
+        GuessCompMetalPlusFoam = "Металл"                                          ' Металл
+        Exit Function                                                              ' Выходим
+    End If                                                                         ' Конец проверки магния
 End Function                                                                        ' Конец GuessCompMetalPlusFoam
 
+    ' --------------------                                                          ' Блок 3: Всё остальное (пластики, резины, керамика и т.п.)
+    GuessCompMetalPlusFoam = "Неметалл"                                            ' Если не металл и не композит — считаем неметаллом
 
+End Function                                                                        ' Конец GuessCompMetalPlusFoam
 Function IsMetalByKeywords(materialLower)
 
     On Error Resume Next
@@ -996,42 +785,7 @@ End Function                                                                    
 
 
 Function CleanTSV(s)
-
-    Dim t                                                                           ' Рабочая строка
-    t = CStr(s)                                                                    ' Приводим к строке
-    t = Replace(t, vbTab, " ")                                                     ' Убираем табуляции (ломают TSV)
-    t = Replace(t, vbCr, " ")                                                      ' Убираем CR
-    t = Replace(t, vbLf, " ")                                                      ' Убираем LF
-    CleanTSV = Trim(t)                                                             ' Возвращаем Trim
-
-End Function                                                                        ' Конец CleanTSV
-
-
-Function AppendLineReturnIndex(ByRef arr, line)
-
-    Dim ub                                                                          ' Индекс последнего элемента
-    ub = ArrayLastIndex(arr)                                                        ' Получаем последний индекс
-
-    If ub = -1 Then                                                                ' Если массив пуст
-        ReDim arr(0)                                                               ' Создаём массив из 1 элемента
-        arr(0) = line                                                              ' Пишем строку
-        AppendLineReturnIndex = 0                                                  ' Возвращаем индекс 0
-    Else                                                                           ' Если массив не пуст
-        ReDim Preserve arr(ub + 1)                                                 ' Увеличиваем массив на 1
-        arr(ub + 1) = line                                                         ' Пишем новую строку
-        AppendLineReturnIndex = ub + 1                                             ' Возвращаем индекс добавленного элемента
-    End If                                                                         ' Конец ветвления
-
-End Function                                                                        ' Конец AppendLineReturnIndex
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Файлы/папки/строки                                                                 ' Описание
-' -----------------------------                                                    ' Раздел комментария
-Function WriteAllTextUnicode(path, text)
-
-    On Error Resume Next                                                           ' Перехват ошибок записи
-    Dim fso                                                                        ' FileSystemObject
+@@ -774,50 +1052,311 @@ Function WriteAllTextUnicode(path, text)
     Set fso = CreateObject("Scripting.FileSystemObject")                           ' Создаём FSO
     Dim f                                                                          ' Файл
     Set f = fso.CreateTextFile(path, True, True)                                   ' True=overwrite, True=Unicode (UTF-16 LE)
@@ -1078,7 +832,7 @@ End Function                                                                    
 Function DefaultProjectCodes()
 
     Dim arr                                                                        ' Массив по умолчанию
-    arr = Array("СГТЕ", "SGTE")                                                    ' Базовые коды проекта (кириллица/латиница)
+    ReDim arr(-1)                                                                  ' Создаём пустой массив (ждём данные из Settings)
     DefaultProjectCodes = arr                                                      ' Возвращаем массив
 
 End Function                                                                        ' Конец DefaultProjectCodes
@@ -1342,53 +1096,3 @@ Function ParseStartLevel(s)
     If Left(t, 1) = "G" Then                                                       ' Если начинается с G
         t = Mid(t, 2)                                                              ' Отбрасываем G
     End If                                                                         ' Конец обработки G
-
-    If IsNumeric(t) Then                                                           ' Если остался номер
-        ParseStartLevel = CLng(t)                                                  ' Возвращаем число
-    Else                                                                           ' Иначе
-        ParseStartLevel = -1                                                       ' Ошибка парсинга
-    End If                                                                         ' Конец ветвления
-
-End Function                                                                        ' Конец ParseStartLevel
-
-
-' -----------------------------                                                    ' Раздел комментария
-' Массивы                                                                            ' Описание
-' -----------------------------                                                    ' Раздел комментария
-Function ArrayLastIndex(arr)
-
-    On Error Resume Next                                                           ' Перехват (если массив пустой)
-    Dim ub                                                                         ' UBound
-    ub = UBound(arr)                                                               ' Пытаемся получить верхнюю границу
-    If Err.Number <> 0 Then                                                        ' Если ошибка (массив пуст)
-        Err.Clear                                                                  ' Сбрасываем
-        ArrayLastIndex = -1                                                        ' Возвращаем -1
-        Exit Function                                                              ' Выходим
-    End If                                                                         ' Конец обработки ошибки
-    On Error GoTo 0                                                                ' Снимаем перехват
-
-    If ub < 0 Then                                                                 ' Если вдруг отрицательный
-        ArrayLastIndex = -1                                                        ' Возвращаем -1
-    Else                                                                           ' Иначе
-        ArrayLastIndex = ub                                                        ' Возвращаем индекс
-    End If                                                                         ' Конец ветвления
-
-End Function                                                                        ' Конец ArrayLastIndex
-
-
-Function ArrayAppendValue(arr, value)
-
-    Dim ub                                                                         ' Индекс последнего элемента
-    ub = ArrayLastIndex(arr)                                                       ' Получаем индекс
-
-    If ub = -1 Then                                                                ' Если массив пустой
-        ReDim arr(0)                                                               ' Создаём 1 элемент
-        arr(0) = value                                                             ' Записываем value
-    Else                                                                           ' Если массив не пустой
-        ReDim Preserve arr(ub + 1)                                                 ' Увеличиваем на 1
-        arr(ub + 1) = value                                                        ' Записываем value
-    End If                                                                         ' Конец ветвления
-
-    ArrayAppendValue = arr                                                         ' Возвращаем обновлённый массив
-
-End Function                                                                        ' Конец ArrayAppendValue
