@@ -5,6 +5,7 @@ Dim gRepeatingSubassembliesInTree                                               
 Dim gNonDrawingPartsAsMaterials                                                  ' Флаг: скрывать БЧ-ткань как материалы (из Settings.txt)
 Dim gMassOfStandardParts                                                         ' Флаг: показывать массу стандартных изделий (из Settings.txt)
 Dim gMassOfPKI                                                                   ' Флаг: показывать массу ПКИ (из Settings.txt)
+Dim gMaterialCode                                                                ' Код строки материала из Code.tsv
 Dim gCodesDescriptionKeys                                                        ' Массив кодов из Code.tsv, которые ищем в Description
 Dim gMetalsKeywords                                                             ' Массив ключей металлов из metals_ru_library.tsv (нижний регистр)
 Dim gCompositeKeywords                                                          ' Массив ключевых слов композитов из composites_detect_keywords.tsv
@@ -137,6 +138,9 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
     Dim dictDocType                                                               ' Словарь типа документа для позиции
     Set dictDocType = CreateObject("Scripting.Dictionary")                        ' key -> "ProductDocument"/"PartDocument"/"Unknown"
 
+    Dim dictMaterialMass                                                          ' Словарь накопленных масс скрытых материалов
+    Set dictMaterialMass = CreateObject("Scripting.Dictionary")                   ' key -> Array(оригинальное имя, суммарная масса)
+
     Dim ordASM, ordSGTE, ordFAST, ordPKI                                          ' Массивы порядка по группам
     ordASM = Array()                                                              ' Подсборки
     ordSGTE = Array()                                                             ' Детали проекта (по префиксам Project_code)
@@ -213,10 +217,12 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
     Next                                                                           ' Следующий ребёнок
 
     ' ---- Вывод в нужном порядке: 1) подсборки 2) детали проекта 3) крепёж 4) ПКИ ----      ' Пояснение
-    sumMassEach = sumMassEach + EmitGroup(ordASM, "ASM", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' Подсборки
-    sumMassEach = sumMassEach + EmitGroup(ordSGTE, "SGTE", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Детали проекта (по Project_code)
-    sumMassEach = sumMassEach + EmitGroup(ordFAST, "FAST", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines) ' Крепёж
-    sumMassEach = sumMassEach + EmitGroup(ordPKI, "PKI", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, lines)   ' ПКИ
+    sumMassEach = sumMassEach + EmitGroup(ordASM, "ASM", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, dictMaterialMass, lines)   ' Подсборки
+    sumMassEach = sumMassEach + EmitGroup(ordSGTE, "SGTE", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, dictMaterialMass, lines) ' Детали проекта (по Project_code)
+    sumMassEach = sumMassEach + EmitGroup(ordFAST, "FAST", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, dictMaterialMass, lines) ' Крепёж
+    sumMassEach = sumMassEach + EmitGroup(ordPKI, "PKI", parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, dictMaterialMass, lines)   ' ПКИ
+
+    Call EmitMaterialLines(dictMaterialMass, parentPN, depth, lines)               ' После деталей выводим агрегированные MAT-строки
 
     ProcessNodeCollect = sumMassEach                                               ' Возвращаем массу 1 шт узла
 
@@ -227,7 +233,7 @@ End Function                                                                    
 ' Вывод одной группы (ASM/Project/FAST/PKI)                                        ' Описание
 ' Возвращает вклад массы в родительскую сборку (учитывая qty)                      ' Описание
 ' -----------------------------                                                    ' Раздел комментария
-Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, ByRef lines)
+Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFirst, dictDocType, dictMaterialMass, ByRef lines)
 
     Dim addMass                                                                    ' Суммарная масса, которую добавит эта группа
     addMass = 0                                                                    ' Начинаем с 0
@@ -273,32 +279,60 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
         ElseIf docType = "PartDocument" Then                                       ' Если деталь
 
-            If mode = "FAST" Then                                                  ' Если крепёж
+            Dim partDoc                                                            ' Документ детали
+            Set partDoc = childObj.ReferenceProduct.Parent                         ' Получаем PartDocument
 
-                ' ВАЖНО: для крепежа НЕ заполняем N, O, P, Q в Excel.               ' Пояснение
-                ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "крепеж". ' Пояснение
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, "крепеж", "", "", Empty, Empty)
+            Dim partMat                                                            ' Материал детали
+            Dim partMassEach                                                       ' Масса 1 шт детали
+            Call MeasurePartMaterialAndMass(partDoc, partMat, partMassEach)        ' Измеряем материал и массу
 
+            Dim descHasBCH                                                        ' Флаг наличия БЧ в Description
+            descHasBCH = (InStr(LCase(Trim(CStr(thisDesc))), "бч") > 0)           ' Ищем подстроку "бч" без регистра
 
-                ' Массу крепежа не считаем                                          ' Пояснение
+            Dim isFabric                                                          ' Флаг: материал является тканью/армированием
+            isFabric = IsFabricOrCarbonByMaterial(partMat)                         ' Проверяем материал по словарю композитов
 
-            ElseIf mode = "PKI" Then                                               ' Если ПКИ
+            Dim hideAsMaterial                                                    ' Флаг скрытия детали как материала
+            hideAsMaterial = (gNonDrawingPartsAsMaterials = True And descHasBCH = True And isFabric = True) ' Выполняем все условия из варианта B
 
-                ' ВАЖНО: для ПКИ НЕ заполняем N, O, P, Q в Excel.                   ' Пояснение
-                ' Поэтому в payload отправляем пустые TypeN/MaterialO и Empty по массам, чтобы не попадал текст "ПКИ". ' Пояснение
-                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, "ПКИ", "", "", Empty, Empty)
+            If hideAsMaterial = True Then                                         ' Если нужно скрыть деталь и собрать массу в материал
 
+                Call AccumulateMaterialMass(dictMaterialMass, partMat, partMassEach * qty) ' Накопление массы материала внутри подсборки
+                addMass = addMass + (partMassEach * qty)                          ' Масса учитывается в подсборке
 
-                ' Массу ПКИ не считаем                                              ' Пояснение
+            ElseIf mode = "FAST" Then                                             ' Если крепёж
 
-            Else                                                                   ' Обычная деталь (по префиксам Project_code либо прочее)
+                Dim fastMassEach                                                  ' Отображаемая масса 1 шт крепежа
+                Dim fastMassTotal                                                 ' Отображаемая масса всего крепежа
+                If gMassOfStandardParts = True Then                               ' Проверяем флаг отображения массы стандарта
+                    fastMassEach = partMassEach                                   ' Показываем массу 1 шт
+                    fastMassTotal = partMassEach * qty                            ' Показываем общую массу
+                Else                                                              ' Если показывать нельзя
+                    fastMassEach = Empty                                          ' Оставляем поле пустым
+                    fastMassTotal = Empty                                         ' Оставляем поле пустым
+                End If                                                            ' Конец ветвления отображения массы крепежа
 
-                Dim partDoc                                                        ' Документ детали
-                Set partDoc = childObj.ReferenceProduct.Parent                     ' Получаем PartDocument
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "FAST", "крепеж", thisPN, thisDef, parentPN, qty, "крепеж", "", "", fastMassEach, fastMassTotal) ' Строка крепежа с условной массой
 
-                Dim partMat                                                        ' Материал детали
-                Dim partMassEach                                                   ' Масса 1 шт детали
-                Call MeasurePartMaterialAndMass(partDoc, partMat, partMassEach)    ' Измеряем материал и массу
+                addMass = addMass + (partMassEach * qty)                          ' Массу крепежа учитываем в родителе всегда
+
+            ElseIf mode = "PKI" Then                                              ' Если ПКИ
+
+                Dim pkiMassEach                                                   ' Отображаемая масса 1 шт ПКИ
+                Dim pkiMassTotal                                                  ' Отображаемая масса всей позиции ПКИ
+                If gMassOfPKI = True Then                                         ' Проверяем флаг отображения массы ПКИ
+                    pkiMassEach = partMassEach                                    ' Показываем массу 1 шт
+                    pkiMassTotal = partMassEach * qty                             ' Показываем общую массу
+                Else                                                              ' Если отображение выключено
+                    pkiMassEach = Empty                                           ' Поле пустое
+                    pkiMassTotal = Empty                                          ' Поле пустое
+                End If                                                            ' Конец ветвления отображения массы ПКИ
+
+                AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "PKI", "ПКИ", thisPN, thisDef, parentPN, qty, "ПКИ", "", "", pkiMassEach, pkiMassTotal) ' Строка ПКИ с условной массой
+
+                addMass = addMass + (partMassEach * qty)                          ' Массу ПКИ учитываем в родителе всегда
+
+            Else                                                                 ' Обычная деталь (по префиксам Project_code либо прочее)
 
                 Dim typeN                                                          ' Класс материала для столбца N (Металл/Композит/Неметалл)
                 typeN = GuessCompMetalPlusFoam(partMat)                            ' Классифицируем материал по ключевым словам (см. функцию ниже)
@@ -310,7 +344,7 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
 
                 addMass = addMass + (partMassEach * qty)                           ' Добавляем вклад в массу родителя
 
-            End If                                                                 ' Конец ветвления FAST/PKI/PART
+            End If                                                                 ' Конец ветвления скрытия/FAST/PKI/PART
 
         Else                                                                       ' Если тип неизвестный
             AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "UNKNOWN", thisPN, thisPN, thisDef, parentPN, qty, "", "", "", 0, 0) ' Пишем строку “как есть”
@@ -321,6 +355,91 @@ Function EmitGroup(orderKeys, mode, parentProd, parentPN, depth, dictQty, dictFi
     EmitGroup = addMass                                                            ' Возвращаем суммарный вклад массы
 
 End Function                                                                       ' Конец EmitGroup
+
+
+' -----------------------------                                                    ' Раздел комментария
+' Накопление массы материала для MAT-строк                                         ' Описание
+' -----------------------------                                                    ' Раздел комментария
+Sub AccumulateMaterialMass(ByRef dictMaterialMass, materialName, massToAdd)
+
+    Dim normKey                                                                   ' Нормализованный ключ материала (для слияния записей)
+    normKey = LCase(Trim(CStr(materialName)))                                     ' Приводим имя материала к нижнему регистру без пробелов
+
+    If normKey = "" Then                                                          ' Если имя материала пустое
+        Exit Sub                                                                  ' Нечего накапливать
+    End If                                                                        ' Конец проверки пустого имени
+
+    Dim displayName                                                               ' Имя материала как хотим показывать в Excel
+    displayName = Trim(CStr(materialName))                                        ' Обрезаем пробелы по краям
+
+    If dictMaterialMass.Exists(normKey) Then                                      ' Если запись по материалу уже есть
+
+        Dim existingEntry                                                         ' Существующий массив [имя, масса]
+        existingEntry = dictMaterialMass(normKey)                                 ' Достаём запись
+
+        Dim newMass                                                               ' Новая суммарная масса
+        newMass = CDbl(existingEntry(1)) + CDbl(massToAdd)                        ' Складываем текущую массу и добавляемую
+
+        dictMaterialMass(normKey) = Array(existingEntry(0), newMass)              ' Обновляем запись с той же витриной имени
+
+    Else                                                                          ' Если материала ещё не было
+
+        dictMaterialMass.Add normKey, Array(displayName, CDbl(massToAdd))         ' Добавляем новый материал и его массу
+
+    End If                                                                        ' Конец ветвления наличия записи
+
+End Sub                                                                            ' Конец AccumulateMaterialMass
+
+
+' -----------------------------                                                    ' Раздел комментария
+' Вывод накопленных MAT-строк в payload                                             ' Описание
+' -----------------------------                                                    ' Раздел комментария
+Sub EmitMaterialLines(dictMaterialMass, parentPN, depth, ByRef lines)
+
+    Dim matCodeM                                                                  ' Код строки материала из Code.tsv
+    matCodeM = GetMaterialCode()                                                  ' Берём сохранённый код (обычно "мат")
+
+    Dim k                                                                        ' Итератор по ключам словаря материалов
+    For Each k In dictMaterialMass.Keys                                           ' Перебираем все материалы, которые нужно вывести
+
+        Dim entry                                                                ' Текущая запись массива [имя, масса]
+        entry = dictMaterialMass(k)                                               ' Получаем запись по ключу
+
+        Dim displayName                                                          ' Имя материала для вывода
+        displayName = ""                                                         ' Инициализируем пустой строкой
+        If IsArray(entry) Then                                                   ' Проверяем, что запись — массив
+            If UBound(entry) >= 0 Then                                           ' Если есть элемент с именем
+                displayName = CStr(entry(0))                                     ' Берём имя материала как есть
+            End If                                                               ' Конец проверки наличия имени
+        End If                                                                   ' Конец проверки на массив
+
+        Dim totalMass                                                            ' Масса материала для данной подсборки
+        totalMass = 0                                                            ' Инициализируем массой 0
+        If IsArray(entry) Then                                                   ' Проверяем тип записи
+            If UBound(entry) >= 1 Then                                           ' Если есть элемент с массой
+                totalMass = CDbl(entry(1))                                       ' Берём накопленную массу
+            End If                                                               ' Конец проверки наличия массы
+        End If                                                                   ' Конец проверки на массив
+
+        AppendLineReturnIndex lines, MakeTSVLine(depth + 1, "материал", displayName, "", displayName, parentPN, 1, matCodeM, "", displayName, totalMass, totalMass) ' Добавляем MAT-строку как дочерний элемент
+
+    Next                                                                         ' Следующий материал из словаря
+
+End Sub                                                                            ' Конец EmitMaterialLines
+
+
+' -----------------------------                                                    ' Раздел комментария
+' Получение кода для материалов из Code.tsv                                        ' Описание
+' -----------------------------                                                    ' Раздел комментария
+Function GetMaterialCode()
+
+    If Trim(CStr(gMaterialCode)) <> "" Then                                      ' Если код материала загружен и непустой
+        GetMaterialCode = gMaterialCode                                           ' Возвращаем код из файла
+    Else                                                                          ' Если по каким-то причинам код не задан
+        GetMaterialCode = "мат"                                                  ' Используем дефолтное значение
+    End If                                                                        ' Конец проверки наличия кода
+
+End Function                                                                       ' Конец GetMaterialCode
 
 
 ' -----------------------------                                                    ' Раздел комментария
@@ -1063,6 +1182,7 @@ Function LoadCodesFromFile(workFolder)
     End If                                                                         ' Конец проверки наличия файла
 
     gCodesDescriptionKeys = Array()                                                ' Сбрасываем список кодов, которые ищем в Description
+    gMaterialCode = "мат"                                                         ' Дефолтный код материала на случай отсутствия в файле
 
     Dim readOk                                                                    ' Флаг успешного чтения Code.tsv
     readOk = False                                                                ' Инициализируем ложью
@@ -1111,6 +1231,13 @@ Function LoadCodesFromFile(workFolder)
                     hasDescriptionFlag = True                                    ' Отмечаем наличие пометки
                 End If                                                            ' Конец проверки колонки
             Next                                                                  ' Следующая колонка
+
+            Dim normalizedCodeKey                                               ' Код в нижнем регистре для дополнительных проверок
+            normalizedCodeKey = LCase(Trim(CStr(codeKey)))                      ' Нормализуем код
+
+            If normalizedCodeKey = "мат" And Trim(CStr(codeKey)) <> "" Then    ' Если нашли строку для материалов
+                gMaterialCode = Trim(CStr(codeKey))                              ' Сохраняем код материала как в файле
+            End If                                                               ' Конец проверки кода материала
 
             If codeKey <> "" And hasDescriptionFlag = True Then                 ' Если код заполнен и есть пометка description
                 gCodesDescriptionKeys = ArrayAppendValue(gCodesDescriptionKeys, codeKey) ' Добавляем код в список поиска по Description
