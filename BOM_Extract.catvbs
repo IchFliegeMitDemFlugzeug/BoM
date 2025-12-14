@@ -148,7 +148,12 @@ Function ProcessNodeCollect(parentProd, parentPN, depth, ByRef lines)           
         childPN = SafeGetPartNumber(child)                                        ' Берём PartNumber
 
         Dim key                                                                   ' Ключ агрегирования
-        key = childPN & "|" & docType                                             ' PartNumber + тип документа
+        key = ""                                                                  ' Инициализируем ключ пустой строкой
+        If docType = "ProductDocument" And gRepeatingSubassembliesInTree = True Then ' Если это подсборка и в настройках включено повторение
+            key = childPN & "|" & docType & "|instance|" & CStr(i)             ' Создаём уникальный ключ на каждое вхождение подсборки
+        Else                                                                      ' Если подсборки нужно суммировать или это деталь/ПКИ
+            key = childPN & "|" & docType                                         ' Агрегируем по PartNumber и типу документа
+        End If                                                                    ' Конец ветвления формирования ключа
 
         If dictQty.Exists(key) Then                                               ' Если позиция уже встречалась
             dictQty(key) = CLng(dictQty(key)) + 1                                 ' Увеличиваем количество
@@ -603,7 +608,7 @@ Function IsSGTE(partNumber)
         prefix = LCase(Trim(CStr(gProjectCodePrefixes(i))))                        ' Нормализуем префикс из настроек
 
         If prefix <> "" Then                                                      ' Пустые значения пропускаем
-            If Left(normalizedPN, Len(prefix)) = prefix Then                       ' Если PartNumber начинается с префикса
+            If InStr(normalizedPN, prefix) > 0 Then                                ' Ищем префикс в любой позиции PartNumber без регистра
                 IsSGTE = True                                                      ' Это “своя” деталь/сборка
                 Exit Function                                                      ' Сразу выходим — хватило одного совпадения
             End If                                                                 ' Конец проверки совпадения
